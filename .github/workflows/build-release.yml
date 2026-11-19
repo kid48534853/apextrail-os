@@ -59,16 +59,20 @@ jobs:
           sdkmanager "platform-tools" "platforms;android-34" "build-tools;34.0.0" "ndk;27.0.12077973"
           export ANDROID_NDK_HOME="$ANDROID_HOME/ndk/27.0.12077973"
           export NDK_HOME="$ANDROID_NDK_HOME"
-          { echo "ANDROID_HOME=$ANDROID_HOME"; echo "ANDROID_SDK_ROOT=$ANDROID_HOME"; echo "ANDROID_NDK_HOME=$ANDROID_NDK_HOME"; echo "NDK_HOME=$NDK_HOME"; echo "$ANDROID_HOME/cmdline-tools/latest/bin"; echo "$ANDROID_HOME/platform-tools"; } >> "$GITHUB_ENV"
+          { echo "ANDROID_HOME=$ANDROID_HOME"; echo "ANDROID_SDK_ROOT=$ANDROID_HOME"; echo "ANDROID_NDK_HOME=$ANDROID_NDK_HOME"; echo "NDK_HOME=$NDK_HOME"; } >> "$GITHUB_ENV"
+          { echo "$ANDROID_HOME/cmdline-tools/latest/bin"; echo "$ANDROID_HOME/platform-tools"; } >> "$GITHUB_PATH"
       - name: Build Android APK
         run: |
           set -euo pipefail
           npm install
           python3 -c "import struct, zlib; w=h=512; raw=(b'\x00'+b'\x84\xcc\x16\xff'*w)*h; chunk=lambda t,d: struct.pack('>I',len(d))+t+d+struct.pack('>I',zlib.crc32(t+d)&0xffffffff); open('app-icon.png','wb').write(b'\x89PNG\r\n\x1a\n'+chunk(b'IHDR',struct.pack('>IIBBBBB',w,h,8,6,0,0,0))+chunk(b'IDAT',zlib.compress(raw))+chunk(b'IEND',b''))"
           npx tauri icon app-icon.png
-          npx tauri android init --ci || true
+          if [ ! -d "src-tauri/gen/android" ]; then
+            npx tauri android init --ci --skip-deps-install || npx tauri android init --ci
+          fi
           npx tauri android build --apk --target aarch64
+          find src-tauri/gen/android -name "*.apk" -ls
       - uses: actions/upload-artifact@v4
         with:
           name: ApexTrail-Android-APK
-          path: src-tauri/gen/android/app/build/outputs/apk/universal/release/*.apk
+          path: src-tauri/gen/android/app/build/outputs/apk/**/*.apk
