@@ -1,86 +1,36 @@
 name: Build ApexTrail OS
 
-on:
-push:
-tags:
-  - 'v*'
-workflow_dispatch:
+on# 
+  push:
+    tags:
+      - 'v*'
+  work_flow_dispatch:
 
 permissions:
-contents: write
+  contents: write
 
 jobs:
-build-windows:
-runs-on: windows-latest
-steps:
-  - name: Checkout repository
-    uses: actions/checkout@v4
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
-  - name: Setup Node.js
-    uses: actions/setup-node@v4
-    with:
-      node-version: 22
+      - name: Setup Node.js
+        uses: actions/setup-node@v8
+        with:
+          node-version: 22
 
-  - name: Setup Rust
-    uses: dtolnay/rust-toolchain@stable
-
-  - name: Install dependencies, generate icon and build Windows EXE
-    shell: bash
-    run: |
-      set -euo pipefail
-      npm install
-      python -c "import struct, zlib; w=h=512; raw=b''.join(b'\x00'+b'\x84\xcc\x16\xff'*w for _ in range(h)); chunk=lambda t,d: struct.pack('>I',len(d))+t+d+struct.pack('>I',zlib.crc32(t+d)&0xffffffff); open('app-icon.png','wb').write(b'\x89PNG\r\n\x1a\n'+chunk(b'IHDR',struct.pack('>IIBBBBB',w,h,8,6,0,0,0))+chunk(b'IDAT',zlib.compress(raw))+chunk(b'IEND',b''))"
-      npx tauri icon app-icon.png
-      npm run tauri build -- --bundles nsis
-
-  - name: Upload Windows EXE artifact
-    uses: actions/upload-artifact@v4
-    with:
-      name: ApexTrail-Windows-EXE
-      path: src-tauri/target/release/bundle/nsis/*.exe
-
-build-android:
-runs-on: ubuntu-latest
-steps:
-  - name: Checkout repository
-    uses: actions/checkout@v4
-
-  - name: Setup Node.js
-    uses: actions/setup-node@v4
-    with:
-      node-version: 22
-
-  - name: Setup Java 17
-    uses: actions/setup-java@v4
-    with:
-      distribution: 'temurin'
-      java-version: '17'
-
-  - name: Setup Rust and Android targets
-    uses: dtolnay/rust-toolchain@stable
-    with:
-      targets: aarch64-linux-android,armv7-linux-androideabi
-
-  - name: Setup Android SDK
-    uses: android-actions/setup-android@v3
-
-  - name: Accept Android licenses, install NDK and build APK
-    run: |
-      set -euo pipefail
-      yes | sdkmanager --licenses >/dev/null 2>&1 || true
-      sdkmanager "platform-tools" "platforms;android-34" "build-tools;34.0.0" "ndk;27.0.12077973"
-      NDK_DIR="$ANDROID_HOME/ndk/27.0.12077973"
-      echo "ANDROID_NDK_HOME=$NDK_DIR" >> "$GITHUB_ENV"
-      echo "NDK_HOME=$NDK_DIR" >> "$GITHUB_ENV"
-
-      npm install
-      python3 -c "import struct, zlib; w=h=512; raw=b''.join(b'\x00'+b'\x84\xcc\x16\xff'*w for _ in range(h)); chunk=lambda t,d: struct.pack('>I',len(d))+t+d+struct.pack('>I',zlib.crc32(t+d)&0xffffffff); open('app-icon.png','wb').write(b'\x89PNG\r\n\x1a\n'+chunk(b'IHDR',struct.pack('>IIBBBBB',w,h,8,6,0,0,0))+chunk(b'IDAT',zlib.compress(raw))+chunk(b'IEND',b''))"
-      npx tauri icon app-icon.png
-      npx tauri android init --ci --skip-deps-install || npx tauri android init --ci
-      npx tauri android build --apk --target aarch64
-
-  - name: Upload Android APK artifact
-    uses: actions/upload-artifact@v4
-    with:
-      name: ApexTrail-Android-APK
-      path: src-tauri/gen/android/app/build/outputs/apk/universal/release/*.apk
+      - name: Setup Rust
+        usUÌè‘Ñ½±¹…ä½ÉÕÍÐµÑ½½±¡…¥¹ÍÑ…‰±”((€€€€€€´¹…µ”è%¹ÍÑ…±°‘•Á•¹‘•¹¥•Ì°•¹•É…Ñ”¥½¸…¹‰Õ¥±]¥¹‘½ÝÌa(€€€€€€€Í¡•±°è‰…Í (€€€€€€€ÉÕ¸èð(€€€€€€€€€Í•Ð€µ•Õ¼Á¥Á•™…¥°(€€€€€€€€€¹Á´¥¹ÍÑ…±°(€€€€€€€€€ÁåÑ¡½¸€µŒ€‰¥µÁ½ÉÐÍÑÉÕÐ°é±¥ˆìÜõ ôÔÄÈìÉ…Üõˆœœ¹©½¥¸¡ˆqàÀÀœ­ˆqààÑqáqàÄÙq™˜œ©°™½È|¥¸É…¹”¡ ¤¤ì¡Õ¹¬õ±…µ‰‘„Ð±èÍÑÉÕÐ¹Á…¬ œù$œ±é±•¸¡¤¤­…Ñ­­ÍÑÉÕÐ¹Á…¬ œù$œ±é±¥ˆ¹ÉŒÌÈ¡Ð­Ð­¤˜Áá™™™™™™™˜¤ì½Á•¸ …ÁÀµ¥½¸¹Á¹œœ°Ýˆœ¤¹ÝÉ¥Ñ”¡ˆqààåA9qÉq¹qàÅ…q¸œ­¡Õ¹¬¡ˆ%!Hœ±ÍÑÉÕÐ¹Á…¬ œù%%			œ±Ü± °à°Ø°À°À°À¤¤­¡Õ¹¬¡ˆ%Pœ±mé±¥ˆ¹½µÁÉ•ÍÌ¡É…Ü¤¤­¡Õ¹¬¡ˆ%9œ±ˆœœ¤¤ˆ(€€€€€€€€€¹ÁàÑ…ÕÉ¤¥½¸…ÁÀµ¥½¸¹Á¹œ(€€€€€€€€€¹Á´ÉÕ¸Ñ…ÕÉ¤‰Õ¥±€´´€´µ‰Õ¹‘±•Ì¹Í¥Ì((€€€€€€´¹…µ”èUÁ±½…]¥¹‘½ÝÌa…ÉÑ¥™…Ð(€€€€€€€ÕÍ•Ìè…Ñ¥½¹Ì½ÕÁ±½…µ…ÉÑ¥™…ÑØÐ(€€€€€€€Ý¥Ñ è(€€€€€€€€€¹…µ”èÁ•áQÉ…¥°µ]¥¹‘½ÝÌµa(€€€€€€€€€Á…Ñ èÍÉŒµÑ…ÕÉ¤½Ñ…É•Ð½É•±•…Í”½‰Õ¹‘±”½¹Í¥Ì¼¨¹•á”((€‰Õ¥±µ…¹‘É½¥è(€€€ÉÕ¹Ìµ½¸èÕ‰Õ¹ÑÔµ±…Ñ•ÍÐ(€€€ÍÑ•ÁÌè(€€€€€€´¹…µ”è¡•­½ÕÐÉ•Á½Í¥Ñ½Éä(€€€€€€€ÕÍW3¢7F–öç2ö6†V6¶÷WDc@ ¢ÒæÖS¢6WGWæöFRæ§0¢W6W3¢7F–öç2÷6WGWÖæöFTc€¢v—Fƒ ¢æöFR×fW'6–öã¢#  ¢ÒæÖS¢6WGW¦fp¢W5\ÎˆXÝ[ÛœËÜÙ]\Z˜]˜PŽˆÚ]‚ˆ\ÝšX][ÛŽˆ	Ý[]\š[‰Âˆ˜]˜K]™\œÚ[ÛŽˆ	ÌMÉÂ‚ˆH˜[YNˆÙ]\\Ý[™[™›ÚY\™Ù]Âˆ\Ù\ÎˆÛ˜^KÜ\Ý]ÛÛÚZ[ÝX›BˆÚ]‚ˆ\™Ù]ÎˆX\˜Ú[[^X[™›ÚY\›]Ë[[^X[™›ÚYXXšB‚ˆH˜[YNˆÙ]\[™›ÚYÑÂˆ\Ù\Îˆ[™›ÚYXXÝ[ÛœËÜÙ]\X[™›ÚYŒÂ‚ˆH˜[YNˆXØÙ\[™›ÚYXÙ[œÙ\Ë[œÝ[‘È[™Z[TÂ‚ˆ®žˆˆÙ]Y][È\Y˜Z[ˆY\ÈÙÛX[˜YÙ\ˆK[XÙ[œÙ\È‹Ù]‹Û[‰ŒHYBˆÙÛX[˜YÙ\ˆœ]›Ü›K]ÛÛÈˆœ]›Ü›\ÎØ[™›ÚYLÍˆ˜Z[]ÛÛÎÌÍŒŒˆ›™ÎÌËŒŒLŒÍÎMÌÈ‚ˆ‘×ÑTH‰S‘“ÒQÒÓQKÛ™ËÌËŒŒLŒÍÎMÌÈ‚ˆXÚÈS‘“ÒQÓ‘×ÒÓQOI‘×ÑTˆˆˆ‰ÒUP—ÑS•ˆ‚ˆXÚÈ“‘×ÒÓQOI‘×ÑTˆˆˆ‰ÒUP—ÑS•ˆ‚‚ˆœH[œÝ[ˆ]ÛŒÈXÈš[\ÜÝXÝ›XŽÈÏZMLLŽÈ˜]ÏX‰ÉËš›Ú[Š‰×	ÊØ‰×Ø×M—™‰Ê››ÜˆÈ[ˆ˜[™ÙJ
+JNÈÚ[šÏ[[X™HˆÝXÝœXÚÊ	Ï’IË›[Š
+JJØ]
+Ù
+ÜÝXÝœXÚÊ	Ï’IË›X‹˜Ü˜ÌÌŠ
+Ý
+Ù
+IŒ™™™™™™™ŠNÈÜ[Š	Ø\ZXÛÛ‹œ™ÉË	ÝØ‰ÊKÜš]J‰×T‘×——XW‰ÊØÚ[šÊ‰ÒR‰ËÝXÝœXÚÊ	Ï’RP‘‰ËË‹
+JJØÚ[šÊ‰ÒQU	ËÞ›X‹˜ÛÛ\™\ÜÊ˜]ÊJJØÚ[šÊ‰ÒQS‘	Ë‰ÉÊJH‚ˆœ]\šHXÛÛˆ\ZXÛÛ‹œ™Âˆž]\šH[™›ÚY[š]KXÚHK\ÚÚ\Y\ËZ[œÝ[œ]\šH[™›ÚY[š]KXÚBˆœ]\šH[™›ÚYZ[KX\ÈK]\™Ù]X\˜Ú‚ˆH˜[YNˆ\ØY[™›ÚYTÈ\Y˜XÝˆ\Õs: actions/upload-artifact@v4
+        with:
+          name: ApexTrail-Android-APK
+          path: src-tauri/gen/android/app/build/outputs/apk/universal/release/*.apk
