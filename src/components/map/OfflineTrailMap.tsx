@@ -1,6 +1,7 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
 import { invoke } from '@tauri-apps/api/core'
+import { listen } from '@tauri-apps/api/event'
 import {
   AlertTriangle,
   Box,
@@ -191,7 +192,7 @@ export const OfflineTrailMap: React.FC<OfflineTrailMapProps> = ({
   const [regionPresetId, setRegionPresetId] = useState<RegionPresetId>('taiwan-rudy')
   const [minZoom, setMinZoom] = useState<number>(9)
   const [maxZoom, setMaxZoom] = useState<number>(13)
-  const [batchCap, setBatchCap] = useState<number>(1500)
+  const [batchCap, setBatchCap] = useState<number>(0)
   const [includeTerrainDownload, setIncludeTerrainDownload] = useState<boolean>(true)
 
   const [centerLon, setCenterLon] = useState<number>(120.96)
@@ -211,6 +212,33 @@ export const OfflineTrailMap: React.FC<OfflineTrailMapProps> = ({
   const [offRouteDistance, setOffRouteDistance] = useState<number | null>(null)
   const [downloadMsg, setDownloadMsg] = useState<string>('')
   const [isDownloading, setIsDownloading] = useState<boolean>(false)
+  const [downloadProgress, setDownloadProgress] = useState<{
+    total: number
+    completed: number
+    downloaded: number
+    skipped: number
+    failed: number
+    percent: number
+  } | null>(null)
+
+  useEffect(() => {
+    let unlisten: (() => void) | null = null
+    void listen<{
+      total: number
+      completed: number
+      downloaded: number
+      skipped: number
+      failed: number
+      percent: number
+    }>('offline-download-progress', (event) => {
+      setDownloadProgress(event.payload)
+    }).then((fn) => {
+      unlisten = fn
+    })
+    return () => {
+      if (unlisten) unlisten()
+    }
+  }, [])
 
   const [poiName, setPoiName] = useState<string>('')
   const [poiCategory, setPoiCategory] = useState<PoiCategory>('water')
@@ -705,7 +733,7 @@ export const OfflineTrailMap: React.FC<OfflineTrailMapProps> = ({
             max_lon: targetBounds.maxLon,
             min_zoom: lowZ,
             max_zoom: Math.min(highZ, 15),
-            max_tiles: Math.min(batchCap, 1000)
+            max_tiles: batchCap === 0 ? 0 : Math.min(batchCap, 1000)
           }
         })
         terrainSummary = ` ｜ 地形渲染：新下載 ${terrainRes.downloaded} 張、已快取 ${terrainRes.skipped_cached} 張`
@@ -861,6 +889,7 @@ export const OfflineTrailMap: React.FC<OfflineTrailMapProps> = ({
                   aria-label="單批下載張數上限"
                   className="rounded-lg border border-[#2a323d] bg-[#161b22] px-2 py-1 font-mono text-white"
                 >
+                  <option value={0}>無上限（一次載完）</option>
                   <option value={500}>500 張</option>
                   <option value={1500}>1500 張</option>
                   <option value={3000}>3000 張</option>
@@ -1158,6 +1187,22 @@ export const OfflineTrailMap: React.FC<OfflineTrailMapProps> = ({
         </div>
       </div>
 
+            {!isFullScreen && isDownloading && downloadProgress && (
+        <div className="space-y-1.5 rounded-xl border border-sky-500/30 bg-[#0d1117] p-3 text-xs">
+          <div className="flex items-center justify-between font-mono text-sky-300">
+            <span>下載進度：{downloadProgress.percent.toFixed(1)}%</span>
+            <span>
+              {downloadProgress.completed} / {downloadProgress.total} 張（新載 {downloadProgress.downloaded} · 跳過 {downloadProgress.skipped} · 失敗 {downloadProgress.failed}）
+            </span>
+          </div>
+          <div className="h-2 w-full overflow-hidden rounded-full bg-[#1f2630]">
+            <div
+              className="h-full bg-[#84cc16] transition-all duration-200"
+              style={{ width: `${Math.min(100, downloadProgress.percent)}%` }}
+            />
+          </div>
+        </div>
+      )}
       {!isFullScreen && downloadMsg && <p className="text-xs text-sky-400">{downloadMsg}</p>}
     </div>
   )

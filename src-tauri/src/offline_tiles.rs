@@ -1,8 +1,12 @@
+use base64::{engine::general_purpose::STANDARD, Engine as _};
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
-use tauri::{AppHandle, Manager};
+use std::sync::{mpsc, Arc, Mutex};
+use std::thread;
+use std::time::{Duration, Instant};
+use tauri::{AppHandle, Emitter, Manager};
 
 #[derive(Debug, Deserialize)]
 pub struct DownloadRegionPayload {
@@ -12,13 +16,14 @@ pub struct DownloadRegionPayload {
     pub max_lat: f64,
     pub min_lon: f64,
     pub max_lon: f64,
-    pub min_zoom: u32,
-    pub max_zoom: u32,
-    pub max_tiles: Option<usize>,
+    pub min_zoom: u8,
+    pub max_zoom: u8,
+    /// 0 代表無上限（一次載完）
+    pub max_tiles: usize,
 }
 
 #[derive(Debug, Serialize)]
-pub struct DownloadResult {
+pub struct DownloadRegionResult {
     pub total_tiles: usize,
     pub downloaded: usize,
     pub skipped_cached: usize,
@@ -26,318 +31,272 @@ pub struct DownloadResult {
     pub remaining_in_bounds: usize,
 }
 
-pub const TRANSPARENT_PNG_1X1: &[u8] = &[
-    0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D,
-    0x49, 0x48, 0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01,
-    0x08, 0x06, 0x00, 0x00, 0x00, 0x1F, 0x15, 0xC4, 0x89, 0x00, 0x00, 0x00,
-    0x0D, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9C, 0x63, 0x00, 0x01, 0x00, 0x00,
-    0x05, 0x00, 0x01, 0x0D, 0x0A, 0x2D, 0xB4, 0x00, 0x00, 0x00, 0x00, 0x49,
-    0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
-];
-
-fn encode_base64(input: &[u8]) -> String {
-    const TABLE: &[u8; 64] =
-        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::with_capacity((input.len() + 2) / 3 * 4);
-    for chunk in input.chunks(3) {
-        let b0 = chunk[0] as u32;
-        let b1 = if chunk.len() > 1 { chunk[1] as u32 } else { 0 };
-        let b2 = if chunk.len() > 2 { chunk[2] as u32 } else { 0 };
-        let n = (b0 << 16) | (b1 << 8) | b2;
-        out.push(TABLE[((n >> 18) & 0x3F) as usize] as char);
-        out.push(TABLE[((n >> 12) & 0x3F) as usize] as char);
-        out.push(if chunk.len() > 1 {
-            TABLE[((n >> 6) & 0x3F) as usize] as char
-        } else {
-            '='
-        });
-        out.push(if chunk.len() > 2 {
-            TABLE[(n & 0x3F) as usize] as char
-        } else {
-            '='
-        });
-    }
-    out
+#[derive(Debug, Clone, Serialize)]
+pub struct DownloadProgressPayload {
+    pub total: usize,
+    pub completed: usize,
+    pub downloaded: usize,
+    pub skipped: usize,
+    pub failed: usize,
+    pub percent: f64,
 }
 
-fn get_db_path(app: &AppHandle) -> Result<PathBuf, String> {
-    let app_data_dir = app
-        .path()
-        .app_data_dir()
-        .map_err(|e| format!("無法取得 AppData 目錄: {e}"))?;
-    std::fs::create_dir_all(&app_data_dir)
-        .map_err(|e| format!("建立 AppData 目錄失敗: {e}"))?;
-    Ok(app_data_dir.join("offline_map_tiles.sqlite"))
+fn db_path(app: &AppHandle) -> Result<PathBuf, String> {
+    let dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    Ok(dir.join("offline_tiles.sqlite3"))
 }
 
 fn open_db(app: &AppHandle) -> Result<Connection, String> {
-    let db_path = get_db_path(app)?;
-    let conn = Connection::open(db_path).map_err(|e| format!("開啟 SQLite 失敗: {e}"))?;
+    let conn = Connection::open(db_path(app)?).map_err(|e| e.to_string())?;
     conn.execute_batch(
-        "PRAGMA journal_mode = WAL;
-         PRAGMA synchronous = NORMAL;
-         CREATE TABLE IF NOT EXISTS offline_tiles (
+        "PRAGMA journal_mode=WAL;
+         PRAGMA synchronous=NORMAL;
+         CREATE TABLE IF NOT EXISTS tiles (
              source_id TEXT NOT NULL,
              z INTEGER NOT NULL,
              x INTEGER NOT NULL,
              y INTEGER NOT NULL,
-             tile_data BLOB NOT NULL,
-             updated_at INTEGER NOT NULL,
+             data BLOB NOT NULL,
              PRIMARY KEY (source_id, z, x, y)
          );",
     )
-    .map_err(|e| format!("初始化資料表失敗: {e}"))?;
+    .map_err(|e| e.to_string())?;
     Ok(conn)
 }
 
-fn lat_lon_to_tile_xy(lat: f64, lon: f64, z: u32) -> (u32, u32) {
-    let n = (1_u32 << z.min(18)) as f64;
-    let clamped_lat = lat.clamp(-85.05112878, 85.05112878);
-    let clamped_lon = lon.clamp(-180.0, 179.999999);
-    let lat_rad = clamped_lat.to_radians();
-    let x = (((clamped_lon + 180.0) / 360.0) * n)
+fn lat_lon_to_tile(lat: f64, lon: f64, z: u8) -> (u32, u32) {
+    let n = (1u64 << z) as f64;
+    let clamped = lat.clamp(-85.05112878, 85.05112878).to_radians();
+    let x = (((lon + 180.0) / 360.0) * n).floor().clamp(0.0, n - 1.0) as u32;
+    let y = (((1.0 - (clamped.tan() + 1.0 / clamped.cos()).ln() / std::f64::consts::PI) / 2.0) * n)
         .floor()
-        .max(0.0)
-        .min(n - 1.0) as u32;
-    let y = (((1.0 - (lat_rad.tan() + 1.0 / lat_rad.cos()).ln() / std::f64::consts::PI) / 2.0) * n)
-        .floor()
-        .max(0.0)
-        .min(n - 1.0) as u32;
+        .clamp(0.0, n - 1.0) as u32;
     (x, y)
 }
 
-fn resolve_tile_url(template: &str, source_id: &str, z: u32, x: u32, y: u32) -> String {
-    if !template.trim().is_empty() {
-        return template
-            .replace("{z}", &z.to_string())
-            .replace("{x}", &x.to_string())
-            .replace("{y}", &y.to_string());
-    }
-    if source_id.contains("rudy") {
-        format!("https://tile.happyman.idv.tw/map/rudy/{z}/{x}/{y}.png")
-    } else {
-        format!("https://tile.openstreetmap.org/{z}/{x}/{y}.png")
-    }
-}
-
-pub fn read_cached_tile(app: &AppHandle, source_id: &str, z: u32, x: u32, y: u32) -> Option<Vec<u8>> {
-    let conn = open_db(app).ok()?;
-    let mut stmt = conn
-        .prepare("SELECT tile_data FROM offline_tiles WHERE source_id = ?1 AND z = ?2 AND x = ?3 AND y = ?4")
-        .ok()?;
-    stmt.query_row(params![source_id, z as i64, x as i64, y as i64], |row| {
-        row.get::<_, Vec<u8>>(0)
-    })
-    .ok()
-}
-
-pub fn fetch_and_cache_tile(app: &AppHandle, source_id: &str, z: u32, x: u32, y: u32) -> Option<Vec<u8>> {
-    let url = resolve_tile_url("", source_id, z, x, y);
-    let bytes_opt = tauri::async_runtime::block_on(async move {
-        let client = reqwest::Client::builder()
-            .user_agent("ApexTrailOS/1.0 (Offline-First Trail Companion)")
-            .timeout(std::time::Duration::from_secs(6))
-            .build()
-            .ok()?;
-        let resp = client.get(&url).send().await.ok()?;
-        if !resp.status().is_success() {
-            return None;
-        }
-        let bytes = resp.bytes().await.ok()?.to_vec();
-        if bytes.is_empty() {
-            return None;
-        }
-        Some(bytes)
-    });
-
-    let bytes = bytes_opt?;
-    if let Ok(conn) = open_db(app) {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs() as i64)
-            .unwrap_or(0);
-        let _ = conn.execute(
-            "INSERT OR REPLACE INTO offline_tiles (source_id, z, x, y, tile_data, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            params![source_id, z as i64, x as i64, y as i64, &bytes, now],
-        );
-    }
-    Some(bytes)
+fn build_tile_url(tpl: &str, z: u8, x: u32, y: u32) -> String {
+    tpl.replace("{z}", &z.to_string())
+        .replace("{x}", &x.to_string())
+        .replace("{y}", &y.to_string())
 }
 
 #[tauri::command]
-pub async fn get_tile_data_url(
+pub fn get_tile_data_url(
     app: AppHandle,
     source_id: String,
-    z: u32,
+    z: u8,
     x: u32,
     y: u32,
-    tile_url_template: Option<String>,
+    tile_url_template: String,
 ) -> Result<String, String> {
-    if let Some(cached) = read_cached_tile(&app, &source_id, z, x, y) {
-        return Ok(format!("data:image/png;base64,{}", encode_base64(&cached)));
+    let conn = open_db(&app)?;
+    if let Ok(bytes) = conn.query_row(
+        "SELECT data FROM tiles WHERE source_id=?1 AND z=?2 AND x=?3 AND y=?4",
+        params![source_id, z, x, y],
+        |row| row.get::<_, Vec<u8>>(0),
+    ) {
+        return Ok(format!("data:image/png;base64,{}", STANDARD.encode(bytes)));
     }
 
-    let tpl = tile_url_template.unwrap_or_default();
-    let url = resolve_tile_url(&tpl, &source_id, z, x, y);
-
-    let client = reqwest::Client::builder()
-        .user_agent("ApexTrailOS/1.0 (Offline-First Trail Companion)")
-        .timeout(std::time::Duration::from_secs(7))
+    let url = build_tile_url(&tile_url_template, z, x, y);
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(12))
+        .user_agent("ApexTrailOS/1.0")
         .build()
-        .map_err(|e| format!("建立 HTTP 用戶端失敗: {e}"))?;
+        .map_err(|e| e.to_string())?;
 
-    if let Ok(resp) = client.get(&url).send().await {
-        if resp.status().is_success() {
-            if let Ok(bytes) = resp.bytes().await {
-                if !bytes.is_empty() {
-                    if let Ok(conn) = open_db(&app) {
-                        let now = std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .map(|d| d.as_secs() as i64)
-                            .unwrap_or(0);
-                        let _ = conn.execute(
-                            "INSERT OR REPLACE INTO offline_tiles (source_id, z, x, y, tile_data, updated_at)
-                             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                            params![source_id, z as i64, x as i64, y as i64, bytes.as_ref(), now],
-                        );
-                    }
-                    return Ok(format!("data:image/png;base64,{}", encode_base64(bytes.as_ref())));
-                }
-            }
-        }
+    let resp = client.get(&url).send().map_err(|e| e.to_string())?;
+    if !resp.status().is_success() {
+        return Err(format!("HTTP {}", resp.status()));
     }
-
-    Ok(format!(
-        "data:image/png;base64,{}",
-        encode_base64(TRANSPARENT_PNG_1X1)
-    ))
-}
-
-// 透過標準庫原子計數器控制最大併發數，避免直接依賴外部 tokio crate
-fn acquire_concurrency_slot(active: &Arc<Mutex<usize>>, max_concurrent: usize) {
-    loop {
-        {
-            let mut guard = active.lock().unwrap_or_else(|e| e.into_inner());
-            if *guard < max_concurrent {
-                *guard += 1;
-                return;
-            }
-        }
-        std::thread::sleep(std::time::Duration::from_millis(15));
-    }
-}
-
-fn release_concurrency_slot(active: &Arc<Mutex<usize>>) {
-    let mut guard = active.lock().unwrap_or_else(|e| e.into_inner());
-    if *guard > 0 {
-        *guard -= 1;
-    }
+    let bytes = resp.bytes().map_err(|e| e.to_string())?.to_vec();
+    let _ = conn.execute(
+        "INSERT OR REPLACE INTO tiles (source_id, z, x, y, data) VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![source_id, z, x, y, bytes],
+    );
+    Ok(format!("data:image/png;base64,{}", STANDARD.encode(bytes)))
 }
 
 #[tauri::command]
-pub async fn download_offline_region(
+pub fn download_offline_region(
     app: AppHandle,
     payload: DownloadRegionPayload,
-) -> Result<DownloadResult, String> {
-    let min_z = payload.min_zoom.min(payload.max_zoom).min(16);
-    let max_z = payload.min_zoom.max(payload.max_zoom).min(16);
-    let south = payload.min_lat.min(payload.max_lat);
-    let north = payload.min_lat.max(payload.max_lat);
-    let west = payload.min_lon.min(payload.max_lon);
-    let east = payload.min_lon.max(payload.max_lon);
-    let batch_cap = payload.max_tiles.unwrap_or(1500).clamp(50, 5000);
+) -> Result<DownloadRegionResult, String> {
+    let mut conn = open_db(&app)?;
 
-    let mut all_coords: Vec<(u32, u32, u32)> = Vec::new();
-    for z in min_z..=max_z {
-        let (x_min, y_min) = lat_lon_to_tile_xy(north, west, z);
-        let (x_max, y_max) = lat_lon_to_tile_xy(south, east, z);
-        for x in x_min.min(x_max)..=x_min.max(x_max) {
-            for y in y_min.min(y_max)..=y_min.max(y_max) {
+    // 1. 展開目標經緯度與層級內的所有圖磚座標
+    let mut all_coords: Vec<(u8, u32, u32)> = Vec::new();
+    for z in payload.min_zoom..=payload.max_zoom {
+        let (x1, y1) = lat_lon_to_tile(payload.max_lat, payload.min_lon, z);
+        let (x2, y2) = lat_lon_to_tile(payload.min_lat, payload.max_lon, z);
+        let (min_x, max_x) = (x1.min(x2), x1.max(x2));
+        let (min_y, max_y) = (y1.min(y2), y1.max(y2));
+        for x in min_x..=max_x {
+            for y in min_y..=max_y {
                 all_coords.push((z, x, y));
             }
         }
     }
 
-    let conn = open_db(&app)?;
-    let mut skipped_cached = 0_usize;
-    let mut pending_coords: Vec<(u32, u32, u32)> = Vec::new();
-
-    for (z, x, y) in all_coords {
-        let exists: i64 = conn
-            .query_row(
-                "SELECT COUNT(1) FROM offline_tiles WHERE source_id = ?1 AND z = ?2 AND x = ?3 AND y = ?4",
-                params![payload.source_id, z as i64, x as i64, y as i64],
-                |row| row.get(0),
+    // 2. 預先撈出已快取座標，直接跳過不浪費網路請求
+    let mut cached_set: HashSet<(u8, u32, u32)> = HashSet::new();
+    {
+        let mut stmt = conn
+            .prepare("SELECT z, x, y FROM tiles WHERE source_id=?1 AND z BETWEEN ?2 AND ?3")
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map(
+                params![payload.source_id, payload.min_zoom, payload.max_zoom],
+                |r| Ok((r.get::<_, u8>(0)?, r.get::<_, u32>(1)?, r.get::<_, u32>(2)?)),
             )
-            .unwrap_or(0);
-        if exists > 0 {
+            .map_err(|e| e.to_string())?;
+        for r in rows.flatten() {
+            cached_set.insert(r);
+        }
+    }
+
+    let mut missing: Vec<(u8, u32, u32)> = Vec::new();
+    let mut skipped_cached = 0usize;
+    for c in &all_coords {
+        if cached_set.contains(c) {
             skipped_cached += 1;
         } else {
-            pending_coords.push((z, x, y));
+            missing.push(*c);
         }
     }
 
-    let total_pending_before_batch = pending_coords.len();
-    let batch_coords: Vec<(u32, u32, u32)> = pending_coords.into_iter().take(batch_cap).collect();
-    let batch_len = batch_coords.len();
+    // max_tiles == 0 表示無上限一次載完
+    let (to_download, remaining_in_bounds) =
+        if payload.max_tiles > 0 && missing.len() > payload.max_tiles {
+            let rem = missing.len() - payload.max_tiles;
+            missing.truncate(payload.max_tiles);
+            (missing, rem)
+        } else {
+            (missing, 0)
+        };
 
-    let client = reqwest::Client::builder()
-        .user_agent("ApexTrailOS/1.0 (Offline-First Trail Companion)")
-        .timeout(std::time::Duration::from_secs(10))
+    let total_tiles = skipped_cached + to_download.len();
+    let _ = app.emit(
+        "offline-download-progress",
+        DownloadProgressPayload {
+            total: total_tiles,
+            completed: skipped_cached,
+            downloaded: 0,
+            skipped: skipped_cached,
+            failed: 0,
+            percent: if total_tiles == 0 { 100.0 } else { (skipped_cached as f64 / total_tiles as f64) * 100.0 },
+        },
+    );
+
+    if to_download.is_empty() {
+        return Ok(DownloadRegionResult {
+            total_tiles,
+            downloaded: 0,
+            skipped_cached,
+            failed: 0,
+            remaining_in_bounds,
+        });
+    }
+
+    // 3. 建立 10 執行緒併發下載池 + mpsc 回傳通道
+    let worker_count = 10usize.min(to_download.len());
+    let queue = Arc::new(Mutex::new(to_download));
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(12))
+        .pool_max_idle_per_host(worker_count)
+        .user_agent("ApexTrailOS/1.0")
         .build()
-        .map_err(|e| format!("建立 HTTP 用戶端失敗: {e}"))?;
+        .map_err(|e| e.to_string())?;
 
-    let active_slots = Arc::new(Mutex::new(0_usize));
-    let mut handles = Vec::with_capacity(batch_len);
+    let (tx, rx) = mpsc::channel::<(u8, u32, u32, Option<Vec<u8>>)>();
+    let mut handles = Vec::with_capacity(worker_count);
 
-    for (z, x, y) in batch_coords {
-        acquire_concurrency_slot(&active_slots, 6);
-        let slots_for_task = active_slots.clone();
-        let client_ref = client.clone();
-        let url = resolve_tile_url(&payload.tile_url_template, &payload.source_id, z, x, y);
-        handles.push(tauri::async_runtime::spawn(async move {
-            let result = match client_ref.get(&url).send().await {
-                Ok(resp) if resp.status().is_success() => match resp.bytes().await {
-                    Ok(bytes) if !bytes.is_empty() => Some((z, x, y, bytes.to_vec())),
-                    _ => None,
-                },
-                _ => None,
-            };
-            release_concurrency_slot(&slots_for_task);
-            result
+    for _ in 0..worker_count {
+        let q = Arc::clone(&queue);
+        let c = client.clone();
+        let tpl = payload.tile_url_template.clone();
+        let tx_clone = tx.clone();
+
+        handles.push(thread::spawn(move || loop {
+            let task = { q.lock().ok().and_then(|mut guard| guard.pop()) };
+            let Some((z, x, y)) = task else { break };
+            let url = build_tile_url(&tpl, z, x, y);
+            let data = c
+                .get(&url)
+                .send()
+                .ok()
+                .filter(|r| r.status().is_success())
+                .and_then(|r| r.bytes().ok())
+                .map(|b| b.to_vec());
+            let _ = tx_clone.send((z, x, y, data));
         }));
     }
+    drop(tx);
 
-    let mut downloaded = 0_usize;
-    let mut failed = 0_usize;
+    // 4. 單一 SQLite 寫入端：每 50 張批次 Transaction 提交，並定時推送進度百分比
+    let mut downloaded = 0usize;
+    let mut failed = 0usize;
+    let mut batch: Vec<(u8, u32, u32, Vec<u8>)> = Vec::with_capacity(50);
+    let mut last_emit = Instant::now();
 
-    for h in handles {
-        match h.await {
-            Ok(Some((z, x, y, bytes))) => {
-                let now = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_secs() as i64)
-                    .unwrap_or(0);
-                let res = conn.execute(
-                    "INSERT OR REPLACE INTO offline_tiles (source_id, z, x, y, tile_data, updated_at)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                    params![payload.source_id, z as i64, x as i64, y as i64, &bytes, now],
-                );
-                if res.is_ok() {
-                    downloaded += 1;
-                } else {
-                    failed += 1;
-                }
+    for (z, x, y, opt_bytes) in rx {
+        match opt_bytes {
+            Some(bytes) => {
+                downloaded += 1;
+                batch.push((z, x, y, bytes));
             }
-            _ => failed += 1,
+            None => failed += 1,
+        }
+
+        if batch.len() >= 50 {
+            if let Ok(tx_db) = conn.transaction() {
+                for (bz, bx, by, bdata) in batch.drain(..) {
+                    let _ = tx_db.execute(
+                        "INSERT OR REPLACE INTO tiles (source_id, z, x, y, data) VALUES (?1, ?2, ?3, ?4, ?5)",
+                        params![payload.source_id, bz, bx, by, bdata],
+                    );
+                }
+                let _ = tx_db.commit();
+            }
+        }
+
+        let completed = skipped_cached + downloaded + failed;
+        if last_emit.elapsed() >= Duration::from_millis(200) || completed == total_tiles {
+            last_emit = Instant::now();
+            let percent = ((completed as f64 / total_tiles.max(1) as f64) * 100.0).min(100.0);
+            let _ = app.emit(
+                "offline-download-progress",
+                DownloadProgressPayload {
+                    total: total_tiles,
+                    completed,
+                    downloaded,
+                    skipped: skipped_cached,
+                    failed,
+                    percent: (percent * 10.0).round() / 10.0,
+                },
+            );
         }
     }
 
-    let remaining_in_bounds = total_pending_before_batch.saturating_sub(downloaded);
+    if !batch.is_empty() {
+        if let Ok(tx_db) = conn.transaction() {
+            for (bz, bx, by, bdata) in batch.drain(..) {
+                let _ = tx_db.execute(
+                    "INSERT OR REPLACE INTO tiles (source_id, z, x, y, data) VALUES (?1, ?2, ?3, ?4, ?5)",
+                    params![payload.source_id, bz, bx, by, bdata],
+                );
+            }
+            let _ = tx_db.commit();
+        }
+    }
 
-    Ok(DownloadResult {
-        total_tiles: batch_len + skipped_cached,
+    for h in handles {
+        let _ = h.join();
+    }
+
+    Ok(DownloadRegionResult {
+        total_tiles,
         downloaded,
         skipped_cached,
         failed,
