@@ -70,7 +70,7 @@ jobs:
           if [ ! -d "src-tauri/gen/android" ]; then
             npx tauri android init --ci --skip-deps-install || npx tauri android init --ci
           fi
-          npx tauri android build --apk --target aarch64
+          npx tauri android build --debug --apk --target aarch64
           find src-tauri/gen/android -name "*.apk" -ls
       - uses: actions/upload-artifact@v4
         with:
