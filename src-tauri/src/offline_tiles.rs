@@ -101,21 +101,24 @@ pub fn read_cached_tile(app: &AppHandle, source_id: &str, z: u32, x: u32, y: u32
 
 pub fn fetch_and_cache_tile(app: &AppHandle, source_id: &str, z: u32, x: u32, y: u32) -> Option<Vec<u8>> {
     let url = resolve_tile_url("", source_id, z, x, y);
-    let client = reqwest::blocking::Client::builder()
-        .user_agent("ApexTrailOS/1.0 (Offline-First Trail Companion)")
-        .timeout(std::time::Duration::from_secs(6))
-        .build()
-        .ok()?;
+    let bytes_opt = tauri::async_runtime::block_on(async move {
+        let client = reqwest::Client::builder()
+            .user_agent("ApexTrailOS/1.0 (Offline-First Trail Companion)")
+            .timeout(std::time::Duration::from_secs(6))
+            .build()
+            .ok()?;
+        let resp = client.get(&url).send().await.ok()?;
+        if !resp.status().is_success() {
+            return None;
+        }
+        let bytes = resp.bytes().await.ok()?.to_vec();
+        if bytes.is_empty() {
+            return None;
+        }
+        Some(bytes)
+    });
 
-    let resp = client.get(&url).send().ok()?;
-    if !resp.status().is_success() {
-        return None;
-    }
-    let bytes = resp.bytes().ok()?.to_vec();
-    if bytes.is_empty() {
-        return None;
-    }
-
+    let bytes = bytes_opt?;
     if let Ok(conn) = open_db(app) {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
