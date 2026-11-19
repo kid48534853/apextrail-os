@@ -9,8 +9,8 @@ interface RouteAnalyticsViewProps {
 }
 
 const DEFAULT_CPS: CheckpointInput[] = [
-  { id: 'cp-1', name: 'CP1 登山口補水點', distanceKm: 6.5, hasWater: true },
-  { id: 'cp-2', name: 'CP2 稜線避難山屋', distanceKm: 14.2, hasWater: false, isShelter: true }
+  { id: 'cp-1', name: 'CP1', distanceKm: 6.5, hasWater: true },
+  { id: 'cp-2', name: 'CP2', distanceKm: 14.2, hasWater: false, isShelter: true }
 ]
 
 const formatPace = (secPerKm: number | null | undefined): string => {
