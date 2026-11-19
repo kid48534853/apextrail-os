@@ -3,6 +3,8 @@ import { Upload, Flame, HeartPulse, Zap, Footprints, Droplets, Mountain } from '
 import { parseActivityFile } from '../../core/parsers/activity-parser'
 import { analyzeTrailActivity } from '../../core/algorithms/trail-metrics'
 import { ActivitySummary, CheckpointInput, TrackPoint } from '../../core/types/trail'
+import { CpStrategyPanel } from '../route/CpStrategyPanel'
+import { GpxLibraryPanel } from '../route/GpxLibraryPanel'
 
 interface RouteAnalyticsViewProps {
   onPlannedTrackLoaded: (points: TrackPoint[]) => void
@@ -24,6 +26,15 @@ export const RouteAnalyticsView: React.FC<RouteAnalyticsViewProps> = ({ onPlanne
   const [plannedSummary, setPlannedSummary] = useState<ActivitySummary | null>(null)
   const [actualSummary, setActualSummary] = useState<ActivitySummary | null>(null)
   const [errorMsg, setErrorMsg] = useState('')
+  const [activeTrackPoints, setActiveTrackPoints] = useState<TrackPoint[]>([])
+
+  const handleSelectLibraryTrack = (points: TrackPoint[]) => {
+    if (points.length < 2) return
+    setActiveTrackPoints(points)
+    const summary = analyzeTrailActivity(points, DEFAULT_CPS, { targetEph, bodyWeightKg })
+    setPlannedSummary(summary)
+    onPlannedTrackLoaded(points)
+  }
 
   const handleUpload = async (e: React.ChangeEvent<HTMLInputElement>, mode: 'planned' | 'actual') => {
     const file = e.target.files?.[0]
@@ -93,31 +104,8 @@ export const RouteAnalyticsView: React.FC<RouteAnalyticsViewProps> = ({ onPlanne
         </section>
       )}
 
-      {(actualSummary ?? plannedSummary) && (
-        <section className="overflow-x-auto rounded-2xl border border-[#2a323d] bg-[#161b22] p-4">
-          <h3 className="mb-3 flex items-center gap-2 text-sm font-bold text-slate-100"><Droplets className="h-4 w-4 text-sky-400" />分段 CP 補給策略與 EP / EPH 明細</h3>
-          <table className="w-full min-w-[680px] text-left text-xs">
-            <thead className="border-b border-[#2a323d] text-slate-400">
-              <tr>
-                <th className="py-2">區段</th><th className="py-2">距離 / 爬升</th><th className="py-2">區段 EP</th><th className="py-2">預估 / 實測 EPH</th><th className="py-2">飲水</th><th className="py-2">碳水 / 熱量</th><th className="py-2">鈉</th>
-              </tr>
-            </thead>
-            <tbody className="divide-y divide-[#222933]">
-              {(actualSummary ?? plannedSummary)!.segments.map((seg) => (
-                <tr key={seg.segmentIndex} className="hover:bg-[#1c232d]">
-                  <td className="py-2.5 font-semibold text-slate-200">{seg.fromName} → {seg.toName}</td>
-                  <td className="py-2.5 text-slate-300">{seg.distanceKm} km / +{seg.ascentM}m</td>
-                  <td className="py-2.5 font-bold text-[#84cc16]">{seg.ep} EP</td>
-                  <td className="py-2.5 text-sky-300">{seg.actualEph ? `${seg.actualEph} EPH (${seg.actualEphGrade?.code})` : `預估 ${seg.estimatedHours} hr`}</td>
-                  <td className="py-2.5 text-sky-400">{seg.nutrition.waterMl} ml</td>
-                  <td className="py-2.5 text-amber-300">{seg.nutrition.carbsG}g / {seg.nutrition.caloriesKcal} kcal</td>
-                  <td className="py-2.5 text-slate-300">{seg.nutrition.sodiumMg} mg</td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        </section>
-      )}
+      <CpStrategyPanel track={activeTrackPoints} targetEph={targetEph} weightKg={bodyWeightKg} />
+      <GpxLibraryPanel onSelectTrack={handleSelectLibraryTrack} />
     </div>
   )
 }
