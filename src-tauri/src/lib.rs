@@ -20,6 +20,7 @@ pub fn run() {
                         return Response::builder()
                             .status(StatusCode::OK)
                             .header(CONTENT_TYPE, "image/png")
+                            .header("Access-Control-Allow-Origin", "*")
                             .body(bytes)
                             .unwrap();
                     }
@@ -27,7 +28,9 @@ pub fn run() {
             }
             Response::builder()
                 .status(StatusCode::NOT_FOUND)
-                .body(Vec::new())
+                .header("Access-Control-Allow-Origin", "*")
+                .header(CONTENT_TYPE, "text/plain; charset=utf-8")
+                .body(b"Tile not cached".to_vec())
                 .unwrap()
         })
         .invoke_handler(tauri::generate_handler![
