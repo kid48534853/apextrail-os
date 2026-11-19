@@ -1,4 +1,3 @@
-use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -35,6 +34,31 @@ pub const TRANSPARENT_PNG_1X1: &[u8] = &[
     0x05, 0x00, 0x01, 0x0D, 0x0A, 0x2D, 0xB4, 0x00, 0x00, 0x00, 0x00, 0x49,
     0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
 ];
+
+fn encode_base64(input: &[u8]) -> String {
+    const TABLE: &[u8; 64] =
+        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity((input.len() + 2) / 3 * 4);
+    for chunk in input.chunks(3) {
+        let b0 = chunk[0] as u32;
+        let b1 = if chunk.len() > 1 { chunk[1] as u32 } else { 0 };
+        let b2 = if chunk.len() > 2 { chunk[2] as u32 } else { 0 };
+        let n = (b0 << 16) | (b1 << 8) | b2;
+        out.push(TABLE[((n >> 18) & 0x3F) as usize] as char);
+        out.push(TABLE[((n >> 12) & 0x3F) as usize] as char);
+        out.push(if chunk.len() > 1 {
+            TABLE[((n >> 6) & 0x3F) as usize] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            TABLE[(n & 0x3F) as usize] as char
+        } else {
+            '='
+        });
+    }
+    out
+}
 
 fn get_db_path(app: &AppHandle) -> Result<PathBuf, String> {
     let app_data_dir = app
@@ -151,7 +175,7 @@ pub async fn get_tile_data_url(
     tile_url_template: Option<String>,
 ) -> Result<String, String> {
     if let Some(cached) = read_cached_tile(&app, &source_id, z, x, y) {
-        return Ok(format!("data:image/png;base64,{}", BASE64.encode(&cached)));
+        return Ok(format!("data:image/png;base64,{}", encode_base64(&cached)));
     }
 
     let tpl = tile_url_template.unwrap_or_default();
@@ -178,7 +202,7 @@ pub async fn get_tile_data_url(
                             params![source_id, z as i64, x as i64, y as i64, bytes.as_ref(), now],
                         );
                     }
-                    return Ok(format!("data:image/png;base64,{}", BASE64.encode(bytes.as_ref())));
+                    return Ok(format!("data:image/png;base64,{}", encode_base64(bytes.as_ref())));
                 }
             }
         }
@@ -186,7 +210,7 @@ pub async fn get_tile_data_url(
 
     Ok(format!(
         "data:image/png;base64,{}",
-        BASE64.encode(TRANSPARENT_PNG_1X1)
+        encode_base64(TRANSPARENT_PNG_1X1)
     ))
 }
 
