@@ -8,6 +8,13 @@ use std::thread;
 use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter, Manager};
 
+/// 1x1 透明 PNG 位元組（供自訂協定或 fallback 讀取）
+pub const TRANSPARENT_PNG_1X1: &[u8] = &[
+    137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82, 0, 0, 0, 1, 0, 0, 0, 1, 8,
+    6, 0, 0, 0, 31, 21, 196, 137, 0, 0, 0, 11, 73, 68, 65, 84, 120, 156, 99, 96, 0, 2, 0, 0,
+    5, 0, 1, 13, 10, 45, 180, 0, 0, 0, 0, 73, 69, 78, 68, 174, 66, 96, 130,
+];
+
 #[derive(Debug, Deserialize)]
 pub struct DownloadRegionPayload {
     pub source_id: String,
@@ -75,31 +82,49 @@ fn lat_lon_to_tile(lat: f64, lon: f64, z: u8) -> (u32, u32) {
     (x, y)
 }
 
+fn default_template_for_source(source_id: &str) -> &'static str {
+    match source_id {
+        "osm" => "https://tile.openstreetmap.org/{z}/{x}/{y}.png",
+        "terrain-topo" => "https://tile.opentopomap.org/{z}/{x}/{y}.png",
+        _ => "https://tile.happyman.idv.tw/map/rudy/{z}/{x}/{y}.png",
+    }
+}
+
 fn build_tile_url(tpl: &str, z: u8, x: u32, y: u32) -> String {
     tpl.replace("{z}", &z.to_string())
         .replace("{x}", &x.to_string())
         .replace("{y}", &y.to_string())
 }
 
-#[tauri::command]
-pub fn get_tile_data_url(
-    app: AppHandle,
-    source_id: String,
+/// 讀取 SQLite 快取圖磚（若不存在回傳 Ok(None)）
+pub fn read_cached_tile(
+    app: &AppHandle,
+    source_id: &str,
     z: u8,
     x: u32,
     y: u32,
-    tile_url_template: String,
-) -> Result<String, String> {
-    let conn = open_db(&app)?;
-    if let Ok(bytes) = conn.query_row(
+) -> Result<Option<Vec<u8>>, String> {
+    let conn = open_db(app)?;
+    match conn.query_row(
         "SELECT data FROM tiles WHERE source_id=?1 AND z=?2 AND x=?3 AND y=?4",
         params![source_id, z, x, y],
         |row| row.get::<_, Vec<u8>>(0),
     ) {
-        return Ok(format!("data:image/png;base64,{}", STANDARD.encode(bytes)));
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(e) => Err(e.to_string()),
     }
+}
 
-    let url = build_tile_url(&tile_url_template, z, x, y);
+/// 從遠端抓取單張圖磚並寫入 SQLite 快取
+pub fn fetch_and_cache_tile(
+    app: &AppHandle,
+    source_id: &str,
+    z: u8,
+    x: u32,
+    y: u32,
+) -> Result<Vec<u8>, String> {
+    let url = build_tile_url(default_template_for_source(source_id), z, x, y);
     let client = reqwest::blocking::Client::builder()
         .timeout(Duration::from_secs(12))
         .user_agent("ApexTrailOS/1.0")
@@ -111,6 +136,41 @@ pub fn get_tile_data_url(
         return Err(format!("HTTP {}", resp.status()));
     }
     let bytes = resp.bytes().map_err(|e| e.to_string())?.to_vec();
+    let conn = open_db(app)?;
+    let _ = conn.execute(
+        "INSERT OR REPLACE INTO tiles (source_id, z, x, y, data) VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![source_id, z, x, y, bytes],
+    );
+    Ok(bytes)
+}
+
+#[tauri::command]
+pub fn get_tile_data_url(
+    app: AppHandle,
+    source_id: String,
+    z: u8,
+    x: u32,
+    y: u32,
+    tile_url_template: Option<String>,
+) -> Result<String, String> {
+    if let Some(cached) = read_cached_tile(&app, &source_id, z, x, y)? {
+        return Ok(format!("data:image/png;base64,{}", STANDARD.encode(cached)));
+    }
+
+    let tpl = tile_url_template.unwrap_or_else(|| default_template_for_source(&source_id).to_string());
+    let url = build_tile_url(&tpl, z, x, y);
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(12))
+        .user_agent("ApexTrailOS/1.0")
+        .build()
+        .map_err(|e| e.to_string())?;
+
+    let resp = client.get(&url).send().map_err(|e| e.to_string())?;
+    if !resp.status().is_success() {
+        return Err(format!("HTTP {}", resp.status()));
+    }
+    let bytes = resp.bytes().map_err(|e| e.to_string())?.to_vec();
+    let conn = open_db(&app)?;
     let _ = conn.execute(
         "INSERT OR REPLACE INTO tiles (source_id, z, x, y, data) VALUES (?1, ?2, ?3, ?4, ?5)",
         params![source_id, z, x, y, bytes],
@@ -124,10 +184,11 @@ pub fn download_offline_region(
     payload: DownloadRegionPayload,
 ) -> Result<DownloadRegionResult, String> {
     let mut conn = open_db(&app)?;
+    let safe_min_z = payload.min_zoom.min(18);
+    let safe_max_z = payload.max_zoom.min(18).max(safe_min_z);
 
-    // 1. 展開目標經緯度與層級內的所有圖磚座標
     let mut all_coords: Vec<(u8, u32, u32)> = Vec::new();
-    for z in payload.min_zoom..=payload.max_zoom {
+    for z in safe_min_z..=safe_max_z {
         let (x1, y1) = lat_lon_to_tile(payload.max_lat, payload.min_lon, z);
         let (x2, y2) = lat_lon_to_tile(payload.min_lat, payload.max_lon, z);
         let (min_x, max_x) = (x1.min(x2), x1.max(x2));
@@ -139,7 +200,6 @@ pub fn download_offline_region(
         }
     }
 
-    // 2. 預先撈出已快取座標，直接跳過不浪費網路請求
     let mut cached_set: HashSet<(u8, u32, u32)> = HashSet::new();
     {
         let mut stmt = conn
@@ -147,7 +207,7 @@ pub fn download_offline_region(
             .map_err(|e| e.to_string())?;
         let rows = stmt
             .query_map(
-                params![payload.source_id, payload.min_zoom, payload.max_zoom],
+                params![payload.source_id, safe_min_z, safe_max_z],
                 |r| Ok((r.get::<_, u8>(0)?, r.get::<_, u32>(1)?, r.get::<_, u32>(2)?)),
             )
             .map_err(|e| e.to_string())?;
@@ -166,7 +226,6 @@ pub fn download_offline_region(
         }
     }
 
-    // max_tiles == 0 表示無上限一次載完
     let (to_download, remaining_in_bounds) =
         if payload.max_tiles > 0 && missing.len() > payload.max_tiles {
             let rem = missing.len() - payload.max_tiles;
@@ -185,7 +244,11 @@ pub fn download_offline_region(
             downloaded: 0,
             skipped: skipped_cached,
             failed: 0,
-            percent: if total_tiles == 0 { 100.0 } else { (skipped_cached as f64 / total_tiles as f64) * 100.0 },
+            percent: if total_tiles == 0 {
+                100.0
+            } else {
+                (skipped_cached as f64 / total_tiles as f64) * 100.0
+            },
         },
     );
 
@@ -199,7 +262,6 @@ pub fn download_offline_region(
         });
     }
 
-    // 3. 建立 10 執行緒併發下載池 + mpsc 回傳通道
     let worker_count = 10usize.min(to_download.len());
     let queue = Arc::new(Mutex::new(to_download));
     let client = reqwest::blocking::Client::builder()
@@ -234,7 +296,6 @@ pub fn download_offline_region(
     }
     drop(tx);
 
-    // 4. 單一 SQLite 寫入端：每 50 張批次 Transaction 提交，並定時推送進度百分比
     let mut downloaded = 0usize;
     let mut failed = 0usize;
     let mut batch: Vec<(u8, u32, u32, Vec<u8>)> = Vec::with_capacity(50);

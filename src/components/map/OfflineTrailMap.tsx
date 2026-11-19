@@ -198,6 +198,8 @@ export const OfflineTrailMap: React.FC<OfflineTrailMapProps> = ({
   const [centerLon, setCenterLon] = useState<number>(120.96)
   const [centerLat, setCenterLat] = useState<number>(23.65)
   const [zoomLevel, setZoomLevel] = useState<number>(9)
+  const [customMaxZoom, setCustomMaxZoom] = useState<number>(20)
+  const [resolutionScale, setResolutionScale] = useState<number>(2.0)
 
   // 新增：全螢幕、前進方向朝上、高畫質過採樣、3D 透視角、地形渲染疊加
   const [isFullScreen, setIsFullScreen] = useState<boolean>(false)
@@ -274,7 +276,7 @@ export const OfflineTrailMap: React.FC<OfflineTrailMapProps> = ({
     if (width <= 0 || height <= 0) return
 
     // 解放高 DPI（最高 3x）確保 Android 手機全螢幕銳利度
-    const dpr = Math.min(window.devicePixelRatio || 1, 3)
+    const dpr = Math.max(1, Math.min(3.5, (window.devicePixelRatio || 1) * (resolutionScale / 2)))
     const targetW = Math.floor(width * dpr)
     const targetH = Math.floor(height * dpr)
     if (canvas.width !== targetW || canvas.height !== targetH) {
@@ -300,8 +302,8 @@ export const OfflineTrailMap: React.FC<OfflineTrailMapProps> = ({
     }
 
     // HD 過採樣模式：抓取高一階 Z+1 圖磚（最高 Z16），大幅提升等高線與文字清晰度
-    const baseZ = Math.min(16, Math.max(2, Math.round(zoomLevel)))
-    const fetchZ = isHighClarity ? Math.min(16, baseZ + 1) : baseZ
+    const baseZ = Math.min(customMaxZoom, Math.max(2, Math.round(zoomLevel)))
+    const fetchZ = isHighClarity ? Math.min(customMaxZoom, baseZ + 1) : baseZ
     const scale = Math.pow(2, zoomLevel - fetchZ)
     const tilePx = 256 * scale
     const maxTileIdx = Math.pow(2, fetchZ)
@@ -611,7 +613,7 @@ export const OfflineTrailMap: React.FC<OfflineTrailMapProps> = ({
       const currDist = Math.hypot(p1.x - p2.x, p1.y - p2.y)
       if (pinchPrevDistRef.current && pinchPrevDistRef.current > 10 && currDist > 10) {
         const deltaZoom = Math.log2(currDist / pinchPrevDistRef.current)
-        setZoomLevel((prev) => Math.min(16, Math.max(2, Number((prev + deltaZoom).toFixed(3)))))
+        setZoomLevel((prev) => Math.min(customMaxZoom, Math.max(2, Number((prev + deltaZoom).toFixed(3)))))
       }
       pinchPrevDistRef.current = currDist
       return
@@ -654,7 +656,7 @@ export const OfflineTrailMap: React.FC<OfflineTrailMapProps> = ({
   const handleWheel = (e: React.WheelEvent<HTMLCanvasElement>) => {
     e.preventDefault()
     const delta = e.deltaY < 0 ? 0.5 : -0.5
-    setZoomLevel((prev) => Math.min(16, Math.max(2, Number((prev + delta).toFixed(2)))))
+    setZoomLevel((prev) => Math.min(customMaxZoom, Math.max(2, Number((prev + delta).toFixed(2)))))
   }
 
   const resetTileMemory = () => {
@@ -1118,7 +1120,7 @@ export const OfflineTrailMap: React.FC<OfflineTrailMapProps> = ({
           </button>
           <button
             type="button"
-            onClick={() => setZoomLevel((z) => Math.min(16, Number((z + 1).toFixed(2))))}
+            onClick={() => setZoomLevel((z) => Math.min(customMaxZoom, Number((z + 1).toFixed(2))))}
             aria-label="放大地圖"
             className="rounded-lg p-1.5 text-slate-200 hover:bg-[#2a323d]"
           >
@@ -1173,17 +1175,37 @@ export const OfflineTrailMap: React.FC<OfflineTrailMapProps> = ({
             <Layers className="h-4 w-4" />
           </button>
         </div>
-
-        {/* 左下角即時狀態列 */}
-        <div className="pointer-events-none absolute bottom-2.5 left-3 flex flex-wrap items-center gap-2 rounded-lg bg-[#0d1117]/85 px-2.5 py-1 font-mono text-[11px] text-slate-200">
-          <span>Z{zoomLevel.toFixed(1)}</span>
-          <span>{isHighClarity ? 'HD' : 'SD'}</span>
-          <span>{isHeadingUp ? `航向 ${Math.round(headingDeg)}°` : '正北朝上'}</span>
-          {is3dTilt && <span className="text-emerald-300">3D</span>}
-          {showTerrainOverlay && <span className="text-purple-300">地形疊加</span>}
-          <span className="text-slate-400">
-            {centerLat.toFixed(4)}, {centerLon.toFixed(4)}
-          </span>
+        {/* 左下角即時狀態列 + 自訂放大/解析度控制 */}
+        <div className="absolute bottom-2.5 left-3 flex flex-wrap items-center gap-2 rounded-lg bg-[#0d1117]/90 px-2.5 py-1.5 font-mono text-[11px] text-slate-200">
+          <span>Z{zoomLevel.toFixed(1)}/{customMaxZoom}</span>
+          <span>解析 {resolutionScale.toFixed(1)}x</span>
+          <label className="pointer-events-auto flex items-center gap-1 text-amber-300">
+            <span>最大Z</span>
+            <select
+              value={customMaxZoom}
+              onChange={(e) => setCustomMaxZoom(Number(e.target.value))}
+              aria-label="自訂最大縮放層級"
+              className="rounded border border-[#2a323d] bg-[#161b22] px-1 py-0.5 text-white"
+            >
+              <option value={16}>Z16</option>
+              <option value={18}>Z18</option>
+              <option value={20}>Z20</option>
+              <option value={22}>Z22 (極限拉近)</option>
+            </select>
+          </label>
+          <label className="pointer-events-auto flex items-center gap-1 text-sky-300">
+            <span>解析度</span>
+            <select
+              value={resolutionScale}
+              onChange={(e) => setResolutionScale(Number(e.target.value))}
+              aria-label="自訂地圖解析度倍率"
+              className="rounded border border-[#2a323d] bg-[#161b22] px-1 py-0.5 text-white"
+            >
+              <option value={1.0}>1.0x (省電快)</option>
+              <option value={2.0}>2.0x (高清)</option>
+              <option value={3.0}>3.0x (超細緻)</option>
+            </select>
+          </label>
         </div>
       </div>
 
