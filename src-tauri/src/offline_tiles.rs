@@ -1,6 +1,8 @@
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
+use std::sync::Arc;
+use tokio::sync::Semaphore;
 use tauri::{AppHandle, Manager};
 
 #[derive(Debug, Deserialize)]
@@ -13,6 +15,7 @@ pub struct DownloadRegionPayload {
     pub max_lon: f64,
     pub min_zoom: u32,
     pub max_zoom: u32,
+    pub max_tiles: Option<usize>,
 }
 
 #[derive(Debug, Serialize)]
@@ -21,6 +24,7 @@ pub struct DownloadResult {
     pub downloaded: usize,
     pub skipped_cached: usize,
     pub failed: usize,
+    pub remaining_in_bounds: usize,
 }
 
 pub const TRANSPARENT_PNG_1X1: &[u8] = &[
@@ -63,10 +67,14 @@ fn open_db(app: &AppHandle) -> Result<Connection, String> {
 }
 
 fn lat_lon_to_tile_xy(lat: f64, lon: f64, z: u32) -> (u32, u32) {
-    let n = (1_u32 << z.min(20)) as f64;
+    let n = (1_u32 << z.min(18)) as f64;
     let clamped_lat = lat.clamp(-85.05112878, 85.05112878);
+    let clamped_lon = lon.clamp(-180.0, 179.999999);
     let lat_rad = clamped_lat.to_radians();
-    let x = (((lon + 180.0) / 360.0) * n).floor().max(0.0).min(n - 1.0) as u32;
+    let x = (((clamped_lon + 180.0) / 360.0) * n)
+        .floor()
+        .max(0.0)
+        .min(n - 1.0) as u32;
     let y = (((1.0 - (lat_rad.tan() + 1.0 / lat_rad.cos()).ln() / std::f64::consts::PI) / 2.0) * n)
         .floor()
         .max(0.0)
@@ -81,7 +89,7 @@ fn resolve_tile_url(template: &str, source_id: &str, z: u32, x: u32, y: u32) -> 
             .replace("{x}", &x.to_string())
             .replace("{y}", &y.to_string());
     }
-    if source_id == "rudy" {
+    if source_id.contains("rudy") {
         format!("https://tile.happyman.idv.tw/map/rudy/{z}/{x}/{y}.png")
     } else {
         format!("https://tile.openstreetmap.org/{z}/{x}/{y}.png")
@@ -138,88 +146,107 @@ pub async fn download_offline_region(
     app: AppHandle,
     payload: DownloadRegionPayload,
 ) -> Result<DownloadResult, String> {
-    let min_z = payload.min_zoom.min(payload.max_zoom).min(17);
-    let max_z = payload.min_zoom.max(payload.max_zoom).min(17);
+    let min_z = payload.min_zoom.min(payload.max_zoom).min(16);
+    let max_z = payload.min_zoom.max(payload.max_zoom).min(16);
     let south = payload.min_lat.min(payload.max_lat);
     let north = payload.min_lat.max(payload.max_lat);
     let west = payload.min_lon.min(payload.max_lon);
     let east = payload.min_lon.max(payload.max_lon);
+    let batch_cap = payload.max_tiles.unwrap_or(1500).clamp(50, 5000);
 
-    let mut coords: Vec<(u32, u32, u32)> = Vec::new();
+    let mut all_coords: Vec<(u32, u32, u32)> = Vec::new();
     for z in min_z..=max_z {
         let (x_min, y_min) = lat_lon_to_tile_xy(north, west, z);
         let (x_max, y_max) = lat_lon_to_tile_xy(south, east, z);
         for x in x_min.min(x_max)..=x_min.max(x_max) {
             for y in y_min.min(y_max)..=y_min.max(y_max) {
-                coords.push((z, x, y));
-                if coords.len() >= 450 {
-                    break;
-                }
+                all_coords.push((z, x, y));
             }
-            if coords.len() >= 450 {
-                break;
-            }
-        }
-        if coords.len() >= 450 {
-            break;
         }
     }
 
     let conn = open_db(&app)?;
+    let mut skipped_cached = 0_usize;
+    let mut pending_coords: Vec<(u32, u32, u32)> = Vec::new();
+
+    // 先過濾掉本機 SQLite 已快取的瓦片，支援跨次分批續傳
+    for (z, x, y) in all_coords {
+        let exists: i64 = conn
+            .query_row(
+                "SELECT COUNT(1) FROM offline_tiles WHERE source_id = ?1 AND z = ?2 AND x = ?3 AND y = ?4",
+                params![payload.source_id, z as i64, x as i64, y as i64],
+                |row| row.get(0),
+            )
+            .unwrap_or(0);
+        if exists > 0 {
+            skipped_cached += 1;
+        } else {
+            pending_coords.push((z, x, y));
+        }
+    }
+
+    let total_pending_before_batch = pending_coords.len();
+    let batch_coords: Vec<(u32, u32, u32)> = pending_coords.into_iter().take(batch_cap).collect();
+    let batch_len = batch_coords.len();
+
     let client = reqwest::Client::builder()
         .user_agent("ApexTrailOS/1.0 (Offline-First Trail Companion)")
         .timeout(std::time::Duration::from_secs(10))
         .build()
         .map_err(|e| format!("建立 HTTP 用戶端失敗: {e}"))?;
 
+    // 限制併發數為 6，避免觸發圖磚伺服器頻率限制
+    let semaphore = Arc::new(Semaphore::new(6));
+    let mut handles = Vec::with_capacity(batch_len);
+
+    for (z, x, y) in batch_coords {
+        let permit = semaphore.clone().acquire_owned().await.map_err(|e| format!("併發排程失敗: {e}"))?;
+        let client_ref = client.clone();
+        let url = resolve_tile_url(&payload.tile_url_template, &payload.source_id, z, x, y);
+        handles.push(tauri::async_runtime::spawn(async move {
+            let _p = permit;
+            match client_ref.get(&url).send().await {
+                Ok(resp) if resp.status().is_success() => match resp.bytes().await {
+                    Ok(bytes) if !bytes.is_empty() => Some((z, x, y, bytes.to_vec())),
+                    _ => None,
+                },
+                _ => None,
+            }
+        }));
+    }
+
     let mut downloaded = 0_usize;
-    let mut skipped_cached = 0_usize;
     let mut failed = 0_usize;
-    let total_tiles = coords.len();
 
-    for (z, x, y) in &coords {
-        let exists: i64 = conn
-            .query_row(
-                "SELECT COUNT(1) FROM offline_tiles WHERE source_id = ?1 AND z = ?2 AND x = ?3 AND y = ?4",
-                params![payload.source_id, *z as i64, *x as i64, *y as i64],
-                |row| row.get(0),
-            )
-            .unwrap_or(0);
-
-        if exists > 0 {
-            skipped_cached += 1;
-            continue;
-        }
-
-        let url = resolve_tile_url(&payload.tile_url_template, &payload.source_id, *z, *x, *y);
-        match client.get(&url).send().await {
-            Ok(resp) if resp.status().is_success() => match resp.bytes().await {
-                Ok(bytes) if !bytes.is_empty() => {
-                    let now = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .map(|d| d.as_secs() as i64)
-                        .unwrap_or(0);
-                    let res = conn.execute(
-                        "INSERT OR REPLACE INTO offline_tiles (source_id, z, x, y, tile_data, updated_at)
-                         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                        params![payload.source_id, *z as i64, *x as i64, *y as i64, bytes.as_ref(), now],
-                    );
-                    if res.is_ok() {
-                        downloaded += 1;
-                    } else {
-                        failed += 1;
-                    }
+    for h in handles {
+        match h.await {
+            Ok(Some((z, x, y, bytes))) => {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs() as i64)
+                    .unwrap_or(0);
+                let res = conn.execute(
+                    "INSERT OR REPLACE INTO offline_tiles (source_id, z, x, y, tile_data, updated_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    params![payload.source_id, z as i64, x as i64, y as i64, &bytes, now],
+                );
+                if res.is_ok() {
+                    downloaded += 1;
+                } else {
+                    failed += 1;
                 }
-                _ => failed += 1,
-            },
+            }
             _ => failed += 1,
         }
     }
 
+    let remaining_in_bounds = total_pending_before_batch.saturating_sub(downloaded);
+
     Ok(DownloadResult {
-        total_tiles,
+        total_tiles: batch_len + skipped_cached,
         downloaded,
         skipped_cached,
         failed,
+        remaining_in_bounds,
     })
 }

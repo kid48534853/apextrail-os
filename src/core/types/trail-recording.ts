@@ -4,6 +4,29 @@ export type RecordingSampleMode = 'every-second' | 'smart'
 
 export type PoiCategory = 'water' | 'shelter' | 'signal' | 'bailout' | 'custom'
 
+export type RegionPresetId =
+  | 'viewport'
+  | 'taiwan-rudy'
+  | 'japan-osm'
+  | 'europe-osm'
+  | 'americas-osm'
+  | 'asia-osm'
+
+export interface RegionPresetConfig {
+  id: RegionPresetId
+  label: string
+  sourceId: 'rudy' | 'osm'
+  tileUrlTemplate: string
+  center: [number, number]
+  zoom: number
+  bounds?: {
+    minLat: number
+    maxLat: number
+    minLon: number
+    maxLon: number
+  }
+}
+
 export interface RecordedTrackPoint {
   lat: number
   lon: number

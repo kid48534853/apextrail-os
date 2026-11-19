@@ -7,6 +7,7 @@ import {
   Compass,
   Download,
   Flag,
+  Globe,
   MapPin,
   Navigation,
   Pause,
@@ -16,7 +17,13 @@ import {
   Trash2
 } from 'lucide-react'
 import { TrackPoint } from '../../core/types/trail'
-import { GnssFrequencyMode, PoiCategory, RecordingSampleMode } from '../../core/types/trail-recording'
+import {
+  GnssFrequencyMode,
+  PoiCategory,
+  RecordingSampleMode,
+  RegionPresetConfig,
+  RegionPresetId
+} from '../../core/types/trail-recording'
 import { haversineDistanceM } from '../../core/algorithms/trail-metrics'
 import {
   computeRecordedStats,
@@ -29,16 +36,59 @@ interface OfflineTrailMapProps {
   offRouteThresholdM?: number
 }
 
-type TileSourceKey = 'rudy' | 'osm'
-
-const TILE_SOURCES: Record<TileSourceKey, { label: string; url: string }> = {
-  rudy: {
-    label: '魯地圖 Rudy Map',
-    url: 'https://tile.happyman.idv.tw/map/rudy/{z}/{x}/{y}.png'
+const REGION_PRESETS: Record<RegionPresetId, RegionPresetConfig> = {
+  viewport: {
+    id: 'viewport',
+    label: '目前地圖視野',
+    sourceId: 'rudy',
+    tileUrlTemplate: 'https://tile.happyman.idv.tw/map/rudy/{z}/{x}/{y}.png',
+    center: [120.99, 24.18],
+    zoom: 13
   },
-  osm: {
-    label: 'OpenStreetMap',
-    url: 'https://tile.openstreetmap.org/{z}/{x}/{y}.png'
+  'taiwan-rudy': {
+    id: 'taiwan-rudy',
+    label: '全台灣魯地圖 (Taiwan Rudy)',
+    sourceId: 'rudy',
+    tileUrlTemplate: 'https://tile.happyman.idv.tw/map/rudy/{z}/{x}/{y}.png',
+    center: [120.96, 23.65],
+    zoom: 7,
+    bounds: { minLat: 21.85, maxLat: 25.35, minLon: 119.95, maxLon: 122.05 }
+  },
+  'japan-osm': {
+    id: 'japan-osm',
+    label: '日本全境 (Japan OSM)',
+    sourceId: 'osm',
+    tileUrlTemplate: 'https://tile.openstreetmap.org/{z}/{x}/{y}.png',
+    center: [137.5, 36.2],
+    zoom: 5,
+    bounds: { minLat: 24.0, maxLat: 45.6, minLon: 129.0, maxLon: 146.0 }
+  },
+  'europe-osm': {
+    id: 'europe-osm',
+    label: '歐洲區域 (Europe OSM)',
+    sourceId: 'osm',
+    tileUrlTemplate: 'https://tile.openstreetmap.org/{z}/{x}/{y}.png',
+    center: [12.0, 48.5],
+    zoom: 4,
+    bounds: { minLat: 35.0, maxLat: 66.0, minLon: -10.0, maxLon: 32.0 }
+  },
+  'americas-osm': {
+    id: 'americas-osm',
+    label: '美洲區域 (Americas OSM)',
+    sourceId: 'osm',
+    tileUrlTemplate: 'https://tile.openstreetmap.org/{z}/{x}/{y}.png',
+    center: [-98.0, 38.0],
+    zoom: 3,
+    bounds: { minLat: -35.0, maxLat: 60.0, minLon: -135.0, maxLon: -45.0 }
+  },
+  'asia-osm': {
+    id: 'asia-osm',
+    label: '亞洲區域 (Asia OSM)',
+    sourceId: 'osm',
+    tileUrlTemplate: 'https://tile.openstreetmap.org/{z}/{x}/{y}.png',
+    center: [114.0, 28.0],
+    zoom: 4,
+    bounds: { minLat: 5.0, maxLat: 48.0, minLon: 73.0, maxLon: 145.0 }
   }
 }
 
@@ -70,7 +120,11 @@ export const OfflineTrailMap: React.FC<OfflineTrailMapProps> = ({
     exportRecordedGpx
   } = useTrailRecordingStore()
 
-  const [sourceKey, setSourceKey] = useState<TileSourceKey>('rudy')
+  const [regionPresetId, setRegionPresetId] = useState<RegionPresetId>('taiwan-rudy')
+  const [minZoom, setMinZoom] = useState<number>(7)
+  const [maxZoom, setMaxZoom] = useState<number>(12)
+  const [batchCap, setBatchCap] = useState<number>(1500)
+
   const [isTracking, setIsTracking] = useState(false)
   const [latestPos, setLatestPos] = useState<{ lat: number; lon: number; ele: number } | null>(null)
   const [offRouteDistance, setOffRouteDistance] = useState<number | null>(null)
@@ -81,6 +135,7 @@ export const OfflineTrailMap: React.FC<OfflineTrailMapProps> = ({
   const [poiCategory, setPoiCategory] = useState<PoiCategory>('water')
   const [poiNotes, setPoiNotes] = useState('')
 
+  const activePreset = REGION_PRESETS[regionPresetId]
   const recStats = useMemo(() => computeRecordedStats(recordedPoints), [recordedPoints])
 
   useEffect(() => {
@@ -94,11 +149,11 @@ export const OfflineTrailMap: React.FC<OfflineTrailMapProps> = ({
         sources: {
           'offline-topo': {
             type: 'raster',
-            tiles: [`offline-tile://localhost/${sourceKey}/{z}/{x}/{y}.png`],
+            tiles: [`offline-tile://localhost/${activePreset.sourceId}/{z}/{x}/{y}.png`],
             tileSize: 256,
             minzoom: 0,
-            maxzoom: 17,
-            attribution: `${TILE_SOURCES[sourceKey].label} Offline`
+            maxzoom: 16,
+            attribution: `${activePreset.label} Offline`
           }
         },
         layers: [
@@ -106,8 +161,8 @@ export const OfflineTrailMap: React.FC<OfflineTrailMapProps> = ({
           { id: 'topo-layer', type: 'raster', source: 'offline-topo', paint: { 'raster-opacity': 1 } }
         ]
       },
-      center: [120.99, 24.18],
-      zoom: 13
+      center: activePreset.center,
+      zoom: activePreset.zoom
     })
 
     map.addControl(new maplibregl.NavigationControl(), 'top-right')
@@ -121,7 +176,27 @@ export const OfflineTrailMap: React.FC<OfflineTrailMapProps> = ({
       map.remove()
       mapRef.current = null
     }
-  }, [sourceKey])
+  }, [activePreset.sourceId])
+
+  const handleSelectRegionPreset = (nextId: RegionPresetId) => {
+    setRegionPresetId(nextId)
+    const preset = REGION_PRESETS[nextId]
+    if (nextId === 'taiwan-rudy') {
+      setMinZoom(7)
+      setMaxZoom(12)
+    } else if (nextId === 'viewport') {
+      setMinZoom(11)
+      setMaxZoom(14)
+    } else {
+      // 洲際或跨國大區域建議先下載 Z4~Z8 總覽，再放大特定縣市下載高縮放層級
+      setMinZoom(4)
+      setMaxZoom(7)
+    }
+    const map = mapRef.current
+    if (map) {
+      map.flyTo({ center: preset.center, zoom: preset.zoom })
+    }
+  }
 
   useEffect(() => {
     const map = mapRef.current
@@ -144,9 +219,6 @@ export const OfflineTrailMap: React.FC<OfflineTrailMapProps> = ({
           paint: { 'line-color': '#84cc16', 'line-width': 4, 'line-opacity': 0.9 }
         })
       }
-      const bounds = new maplibregl.LngLatBounds()
-      plannedTrack.forEach((p) => bounds.extend([p.lon, p.lat]))
-      map.fitBounds(bounds, { padding: 48, maxZoom: 15 })
     }
 
     if (map.isStyleLoaded()) renderPlanned()
@@ -246,36 +318,59 @@ export const OfflineTrailMap: React.FC<OfflineTrailMapProps> = ({
     return () => navigator.geolocation.clearWatch(watchId)
   }, [isTracking, gnssMode, plannedTrack, offRouteThresholdM, ingestGpsSample])
 
-  const handleDownloadViewport = async () => {
+  const handleDownloadRegion = async () => {
     const map = mapRef.current
     if (!map) return
     const bounds = map.getBounds()
-    const currentZoom = Math.min(16, Math.max(12, Math.round(map.getZoom())))
+    const targetBounds = activePreset.bounds ?? {
+      minLat: bounds.getSouth(),
+      maxLat: bounds.getNorth(),
+      minLon: bounds.getWest(),
+      maxLon: bounds.getEast()
+    }
+
+    const lowZ = Math.min(minZoom, maxZoom)
+    const highZ = Math.max(minZoom, maxZoom)
+
     setIsDownloading(true)
-    setDownloadMsg(`正在下載 ${TILE_SOURCES[sourceKey].label} 離線圖資 (Z${currentZoom - 1}~Z${currentZoom})...`)
+    setDownloadMsg(
+      `正在下載「${activePreset.label}」離線圖資 (Z${lowZ}~Z${highZ}，單批上限 ${batchCap} 張)...`
+    )
+
     try {
       const res = await invoke<{
         total_tiles: number
         downloaded: number
         skipped_cached: number
         failed: number
+        remaining_in_bounds: number
       }>('download_offline_region', {
         payload: {
-          source_id: sourceKey,
-          tile_url_template: TILE_SOURCES[sourceKey].url,
-          min_lat: bounds.getSouth(),
-          max_lat: bounds.getNorth(),
-          min_lon: bounds.getWest(),
-          max_lon: bounds.getEast(),
-          min_zoom: Math.max(11, currentZoom - 1),
-          max_zoom: currentZoom
+          source_id: activePreset.sourceId,
+          tile_url_template: activePreset.tileUrlTemplate,
+          min_lat: targetBounds.minLat,
+          max_lat: targetBounds.maxLat,
+          min_lon: targetBounds.minLon,
+          max_lon: targetBounds.maxLon,
+          min_zoom: lowZ,
+          max_zoom: highZ,
+          max_tiles: batchCap
         }
       })
+
+      const remainHint =
+        res.remaining_in_bounds > 0
+          ? `；尚有約 ${res.remaining_in_bounds} 張未抓，可再按一次「下載選定區域」續傳`
+          : '；此區域所選層級已全部快取完成'
+
       setDownloadMsg(
-        `離線圖資完成：新下載 ${res.downloaded} 張、已快取 ${res.skipped_cached} 張、失敗 ${res.failed} 張（共 ${res.total_tiles} 張）`
+        `新下載 ${res.downloaded} 張、已快取 ${res.skipped_cached} 張、失敗 ${res.failed} 張${remainHint}`
       )
+
       const src = map.getSource('offline-topo') as maplibregl.RasterTileSource | undefined
-      if (src) src.setTiles([`offline-tile://localhost/${sourceKey}/{z}/{x}/{y}.png?t=${Date.now()}`])
+      if (src) {
+        src.setTiles([`offline-tile://localhost/${activePreset.sourceId}/{z}/{x}/{y}.png?t=${Date.now()}`])
+      }
       map.triggerRepaint()
     } catch (err) {
       setDownloadMsg(`下載失敗：${String(err)}`)
@@ -290,7 +385,7 @@ export const OfflineTrailMap: React.FC<OfflineTrailMapProps> = ({
     map.resize()
     const src = map.getSource('offline-topo') as maplibregl.RasterTileSource | undefined
     if (src) {
-      src.setTiles([`offline-tile://localhost/${sourceKey}/{z}/{x}/{y}.png?t=${Date.now()}`])
+      src.setTiles([`offline-tile://localhost/${activePreset.sourceId}/{z}/{x}/{y}.png?t=${Date.now()}`])
       map.triggerRepaint()
       setDownloadMsg('已重新載入本地離線圖資快取')
     }
@@ -331,18 +426,9 @@ export const OfflineTrailMap: React.FC<OfflineTrailMapProps> = ({
       <div className="flex flex-wrap items-center justify-between gap-2">
         <div className="flex items-center gap-2 text-sm font-semibold text-slate-100">
           <Compass className="h-4 w-4 text-[#84cc16]" />
-          <span>離線等高線地圖、GPS 軌跡記錄與 POI</span>
+          <span>離線等高線地圖、區域批次下載與 GPS 軌跡</span>
         </div>
         <div className="flex flex-wrap items-center gap-2">
-          <select
-            value={sourceKey}
-            onChange={(e) => setSourceKey(e.target.value as TileSourceKey)}
-            aria-label="選擇地圖來源"
-            className="rounded-lg border border-[#2a323d] bg-[#1f2630] px-2.5 py-1.5 text-xs font-bold text-slate-200"
-          >
-            <option value="rudy">魯地圖 Rudy Map</option>
-            <option value="osm">OpenStreetMap</option>
-          </select>
           <button
             type="button"
             onClick={handleReloadTiles}
@@ -361,18 +447,80 @@ export const OfflineTrailMap: React.FC<OfflineTrailMapProps> = ({
             <Navigation className="h-3.5 w-3.5" />
             {isTracking ? 'GPS 定位中' : '開啟 GPS 定位'}
           </button>
-          <button
-            type="button"
-            onClick={handleDownloadViewport}
-            disabled={isDownloading}
-            className="flex items-center gap-1.5 rounded-lg bg-[#84cc16] px-3 py-1.5 text-xs font-bold text-slate-950 disabled:opacity-50"
-          >
-            <Download className="h-3.5 w-3.5" />
-            {isDownloading ? '下載中...' : '下載此區離線地圖'}
-          </button>
         </div>
       </div>
 
+      {/* 區域離線地圖批次下載列（全台灣魯地圖 / 日本 / 歐洲 / 美洲 / 亞洲） */}
+      <div className="flex flex-wrap items-center justify-between gap-2 rounded-xl border border-[#84cc16]/30 bg-[#0d1117] p-3 text-xs">
+        <div className="flex flex-wrap items-center gap-2">
+          <span className="flex items-center gap-1 font-bold text-[#a3e635]">
+            <Globe className="h-3.5 w-3.5" />
+            區域圖資：
+          </span>
+          <select
+            value={regionPresetId}
+            onChange={(e) => handleSelectRegionPreset(e.target.value as RegionPresetId)}
+            aria-label="選擇離線地圖區域"
+            className="rounded-lg border border-[#2a323d] bg-[#161b22] px-2.5 py-1.5 font-semibold text-white"
+          >
+            {Object.values(REGION_PRESETS).map((preset) => (
+              <option key={preset.id} value={preset.id}>
+                {preset.label}
+              </option>
+            ))}
+          </select>
+
+          <label className="flex items-center gap-1 text-slate-300">
+            <span>最小 Z</span>
+            <input
+              type="number"
+              min={2}
+              max={15}
+              value={minZoom}
+              onChange={(e) => setMinZoom(Number(e.target.value) || 7)}
+              className="w-12 rounded-lg border border-[#2a323d] bg-[#161b22] px-1.5 py-1 text-center font-mono text-white"
+            />
+          </label>
+
+          <label className="flex items-center gap-1 text-slate-300">
+            <span>最大 Z</span>
+            <input
+              type="number"
+              min={2}
+              max={16}
+              value={maxZoom}
+              onChange={(e) => setMaxZoom(Number(e.target.value) || 12)}
+              className="w-12 rounded-lg border border-[#2a323d] bg-[#161b22] px-1.5 py-1 text-center font-mono text-white"
+            />
+          </label>
+
+          <label className="flex items-center gap-1 text-slate-300">
+            <span>單批上限</span>
+            <select
+              value={batchCap}
+              onChange={(e) => setBatchCap(Number(e.target.value))}
+              aria-label="單批下載張數上限"
+              className="rounded-lg border border-[#2a323d] bg-[#161b22] px-2 py-1 font-mono text-white"
+            >
+              <option value={500}>500 張</option>
+              <option value={1500}>1500 張</option>
+              <option value={3000}>3000 張</option>
+            </select>
+          </label>
+        </div>
+
+        <button
+          type="button"
+          onClick={handleDownloadRegion}
+          disabled={isDownloading}
+          className="flex items-center gap-1.5 rounded-lg bg-[#84cc16] px-3.5 py-1.5 font-bold text-slate-950 disabled:opacity-50"
+        >
+          <Download className="h-3.5 w-3.5" />
+          {isDownloading ? '批次下載中...' : '下載選定區域'}
+        </button>
+      </div>
+
+      {/* GPS 軌跡記錄控制列 */}
       <div className="flex flex-wrap items-center justify-between gap-2 rounded-xl border border-[#2a323d] bg-[#0d1117] p-3 text-xs">
         <div className="flex flex-wrap items-center gap-2">
           <select
@@ -456,6 +604,7 @@ export const OfflineTrailMap: React.FC<OfflineTrailMapProps> = ({
         </div>
       </div>
 
+      {/* 標記興趣點 (POI) 區塊 */}
       <div className="space-y-2 rounded-xl border border-[#2a323d] bg-[#0d1117] p-3 text-xs">
         <form onSubmit={handleAddPoiAtTarget} className="flex flex-wrap items-center gap-2">
           <span className="flex items-center gap-1 font-bold text-amber-300">
