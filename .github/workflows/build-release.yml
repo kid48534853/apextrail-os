@@ -70,6 +70,7 @@ jobs:
           if [ ! -d "src-tauri/gen/android" ]; then
             npx tauri android init --ci --skip-deps-install || npx tauri android init --ci
           fi
+          if [ ! -d "src-tauri/gen/android/app/src/main/java" ]; then rm -rf src-tauri/gen/android && npx tauri android init; fi && python3 -c "from pathlib import Path; p = Path('src-tauri/gen/android/app/src/main/AndroidManifest.xml'); t = p.read_text(encoding='utf-8'); perms = ['<uses-permission android:name=\"android.permission.ACCESS_COARSE_LOCATION\" />', '<uses-permission android:name=\"android.permission.ACCESS_FINE_LOCATION\" />']; t = t.replace('<application', '\n    '.join([''] + perms) + '\n    <application', 1) if 'ACCESS_FINE_LOCATION' not in t else t; p.write_text(t, encoding='utf-8'); print('Injected Android GPS permissions into', p)"
           npx tauri android build --debug --apk --target aarch64
           find src-tauri/gen/android -name "*.apk" -ls
       - uses: actions/upload-artifact@v4
