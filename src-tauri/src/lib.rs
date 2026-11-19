@@ -65,7 +65,8 @@ pub fn run() {
                 .unwrap()
         })
         .invoke_handler(tauri::generate_handler![
-            offline_tiles::download_offline_region
+            offline_tiles::download_offline_region,
+            offline_tiles::get_tile_data_url
         ])
         .run(tauri::generate_context!())
         .expect("啟動 ApexTrail OS 失敗");

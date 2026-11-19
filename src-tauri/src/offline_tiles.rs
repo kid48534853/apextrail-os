@@ -1,8 +1,8 @@
+use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
-use std::sync::Arc;
-use tokio::sync::Semaphore;
+use std::sync::{Arc, Mutex};
 use tauri::{AppHandle, Manager};
 
 #[derive(Debug, Deserialize)]
@@ -142,6 +142,76 @@ pub fn fetch_and_cache_tile(app: &AppHandle, source_id: &str, z: u32, x: u32, y:
 }
 
 #[tauri::command]
+pub async fn get_tile_data_url(
+    app: AppHandle,
+    source_id: String,
+    z: u32,
+    x: u32,
+    y: u32,
+    tile_url_template: Option<String>,
+) -> Result<String, String> {
+    if let Some(cached) = read_cached_tile(&app, &source_id, z, x, y) {
+        return Ok(format!("data:image/png;base64,{}", BASE64.encode(&cached)));
+    }
+
+    let tpl = tile_url_template.unwrap_or_default();
+    let url = resolve_tile_url(&tpl, &source_id, z, x, y);
+
+    let client = reqwest::Client::builder()
+        .user_agent("ApexTrailOS/1.0 (Offline-First Trail Companion)")
+        .timeout(std::time::Duration::from_secs(7))
+        .build()
+        .map_err(|e| format!("建立 HTTP 用戶端失敗: {e}"))?;
+
+    if let Ok(resp) = client.get(&url).send().await {
+        if resp.status().is_success() {
+            if let Ok(bytes) = resp.bytes().await {
+                if !bytes.is_empty() {
+                    if let Ok(conn) = open_db(&app) {
+                        let now = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_secs() as i64)
+                            .unwrap_or(0);
+                        let _ = conn.execute(
+                            "INSERT OR REPLACE INTO offline_tiles (source_id, z, x, y, tile_data, updated_at)
+                             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                            params![source_id, z as i64, x as i64, y as i64, bytes.as_ref(), now],
+                        );
+                    }
+                    return Ok(format!("data:image/png;base64,{}", BASE64.encode(bytes.as_ref())));
+                }
+            }
+        }
+    }
+
+    Ok(format!(
+        "data:image/png;base64,{}",
+        BASE64.encode(TRANSPARENT_PNG_1X1)
+    ))
+}
+
+// 透過標準庫原子計數器控制最大併發數，避免直接依賴外部 tokio crate
+fn acquire_concurrency_slot(active: &Arc<Mutex<usize>>, max_concurrent: usize) {
+    loop {
+        {
+            let mut guard = active.lock().unwrap_or_else(|e| e.into_inner());
+            if *guard < max_concurrent {
+                *guard += 1;
+                return;
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(15));
+    }
+}
+
+fn release_concurrency_slot(active: &Arc<Mutex<usize>>) {
+    let mut guard = active.lock().unwrap_or_else(|e| e.into_inner());
+    if *guard > 0 {
+        *guard -= 1;
+    }
+}
+
+#[tauri::command]
 pub async fn download_offline_region(
     app: AppHandle,
     payload: DownloadRegionPayload,
@@ -169,7 +239,6 @@ pub async fn download_offline_region(
     let mut skipped_cached = 0_usize;
     let mut pending_coords: Vec<(u32, u32, u32)> = Vec::new();
 
-    // 先過濾掉本機 SQLite 已快取的瓦片，支援跨次分批續傳
     for (z, x, y) in all_coords {
         let exists: i64 = conn
             .query_row(
@@ -195,23 +264,24 @@ pub async fn download_offline_region(
         .build()
         .map_err(|e| format!("建立 HTTP 用戶端失敗: {e}"))?;
 
-    // 限制併發數為 6，避免觸發圖磚伺服器頻率限制
-    let semaphore = Arc::new(Semaphore::new(6));
+    let active_slots = Arc::new(Mutex::new(0_usize));
     let mut handles = Vec::with_capacity(batch_len);
 
     for (z, x, y) in batch_coords {
-        let permit = semaphore.clone().acquire_owned().await.map_err(|e| format!("併發排程失敗: {e}"))?;
+        acquire_concurrency_slot(&active_slots, 6);
+        let slots_for_task = active_slots.clone();
         let client_ref = client.clone();
         let url = resolve_tile_url(&payload.tile_url_template, &payload.source_id, z, x, y);
         handles.push(tauri::async_runtime::spawn(async move {
-            let _p = permit;
-            match client_ref.get(&url).send().await {
+            let result = match client_ref.get(&url).send().await {
                 Ok(resp) if resp.status().is_success() => match resp.bytes().await {
                     Ok(bytes) if !bytes.is_empty() => Some((z, x, y, bytes.to_vec())),
                     _ => None,
                 },
                 _ => None,
-            }
+            };
+            release_concurrency_slot(&slots_for_task);
+            result
         }));
     }
 
