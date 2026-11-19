@@ -216,6 +216,23 @@ export const OfflineTrailMap: React.FC<OfflineTrailMapProps> = ({
   const [poiCategory, setPoiCategory] = useState<PoiCategory>('water')
   const [poiNotes, setPoiNotes] = useState<string>('')
 
+  useEffect(() => {
+    if (typeof document === 'undefined') return
+    document.body.style.overflow = isFullScreen ? 'hidden' : ''
+    try {
+      if (isFullScreen && !document.fullscreenElement) {
+        void document.documentElement.requestFullscreen?.().catch(() => {})
+      } else if (!isFullScreen && document.fullscreenElement) {
+        void document.exitFullscreen?.().catch(() => {})
+      }
+    } catch { /* ignore */ }
+    const t = window.setTimeout(() => window.dispatchEvent(new Event('resize')), 120)
+    return () => {
+      window.clearTimeout(t)
+      document.body.style.overflow = ''
+    }
+  }, [isFullScreen])
+
   const activePreset = REGION_PRESETS[regionPresetId]
   const recStats = useMemo(() => computeRecordedStats(recordedPoints), [recordedPoints])
 
@@ -749,10 +766,11 @@ export const OfflineTrailMap: React.FC<OfflineTrailMapProps> = ({
 
   const mapUi = (
     <div
-      className={
+      className={isFullScreen ? 'flex flex-col bg-[#0d1117]' : 'relative flex flex-col gap-3 rounded-2xl border border-[#2a323d] bg-[#161b22] p-4'}
+      style={
         isFullScreen
-          ? 'fixed inset-0 z-[9999] flex h-[100dvh] w-[100vw] flex-col bg-[#0d1117]'
-          : 'relative flex flex-col gap-3 rounded-2xl border border-[#2a323d] bg-[#161b22] p-4'
+          ? { position: 'fixed', top: 0, left: 0, right: 0, bottom: 0, width: '100vw', height: '100vh', zIndex: 2147483647 }
+          : undefined
       }
     >
       {!isFullScreen && (
