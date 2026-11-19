@@ -1,4 +1,5 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { createPortal } from 'react-dom'
 import { invoke } from '@tauri-apps/api/core'
 import {
   AlertTriangle,
@@ -362,21 +363,28 @@ export const OfflineTrailMap: React.FC<OfflineTrailMapProps> = ({
       ctx.fillText(poi.name, p.x + 9, p.y + 4)
     })
 
-    // 繪製使用者目前位置與前進方向箭頭
+    // 繪製使用者目前位置：實心等腰三角形（尖端指向前進方向）
     if (latestPos) {
       const u = toScreen(latestPos.lat, latestPos.lon)
       ctx.save()
       ctx.translate(u.x, u.y)
       ctx.rotate((headingDeg * Math.PI) / 180)
+
+      // 外圍半透明定位光圈
       ctx.beginPath()
-      ctx.moveTo(0, -13)
-      ctx.lineTo(8, 9)
-      ctx.lineTo(0, 4)
-      ctx.lineTo(-8, 9)
+      ctx.arc(0, 0, 18, 0, Math.PI * 2)
+      ctx.fillStyle = 'rgba(56, 189, 248, 0.22)'
+      ctx.fill()
+
+      // 實心三角形本體（尖端朝前進方向 0,-15）
+      ctx.beginPath()
+      ctx.moveTo(0, -15)
+      ctx.lineTo(10, 10)
+      ctx.lineTo(-10, 10)
       ctx.closePath()
       ctx.fillStyle = '#38bdf8'
       ctx.fill()
-      ctx.lineWidth = 2
+      ctx.lineWidth = 2.5
       ctx.strokeStyle = '#ffffff'
       ctx.stroke()
       ctx.restore()
@@ -739,11 +747,11 @@ export const OfflineTrailMap: React.FC<OfflineTrailMapProps> = ({
     URL.revokeObjectURL(url)
   }
 
-  return (
+  const mapUi = (
     <div
       className={
         isFullScreen
-          ? 'fixed inset-0 z-50 flex flex-col bg-[#0d1117]'
+          ? 'fixed inset-0 z-[9999] flex h-[100dvh] w-[100vw] flex-col bg-[#0d1117]'
           : 'relative flex flex-col gap-3 rounded-2xl border border-[#2a323d] bg-[#161b22] p-4'
       }
     >
@@ -1135,4 +1143,10 @@ export const OfflineTrailMap: React.FC<OfflineTrailMapProps> = ({
       {!isFullScreen && downloadMsg && <p className="text-xs text-sky-400">{downloadMsg}</p>}
     </div>
   )
+
+  if (isFullScreen && typeof document !== 'undefined') {
+    return createPortal(mapUi, document.body)
+  }
+
+  return mapUi
 }
