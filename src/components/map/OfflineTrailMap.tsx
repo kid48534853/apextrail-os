@@ -1,6 +1,4 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import maplibregl from 'maplibre-gl'
-import 'maplibre-gl/dist/maplibre-gl.css'
 import { invoke } from '@tauri-apps/api/core'
 import {
   AlertTriangle,
@@ -9,9 +7,11 @@ import {
   Flag,
   Globe,
   MapPin,
+  Minus,
   Navigation,
   Pause,
   Play,
+  Plus,
   RefreshCw,
   Square,
   Trash2
@@ -36,15 +36,18 @@ interface OfflineTrailMapProps {
   offRouteThresholdM?: number
 }
 
-interface RenderedTile {
-  key: string
-  z: number
-  x: number
-  y: number
-  leftPx: number
-  topPx: number
-  sizePx: number
-  dataUrl: string
+interface GpsFix {
+  lat: number
+  lon: number
+  ele: number
+}
+
+interface DragSnapshot {
+  dragging: boolean
+  startX: number
+  startY: number
+  origLon: number
+  origLat: number
 }
 
 const REGION_PRESETS: Record<RegionPresetId, RegionPresetConfig> = {
@@ -62,7 +65,7 @@ const REGION_PRESETS: Record<RegionPresetId, RegionPresetConfig> = {
     sourceId: 'rudy',
     tileUrlTemplate: 'https://tile.happyman.idv.tw/map/rudy/{z}/{x}/{y}.png',
     center: [120.96, 23.65],
-    zoom: 8,
+    zoom: 9,
     bounds: { minLat: 21.85, maxLat: 25.35, minLon: 119.95, maxLon: 122.05 }
   },
   'japan-osm': {
@@ -103,24 +106,39 @@ const REGION_PRESETS: Record<RegionPresetId, RegionPresetConfig> = {
   }
 }
 
-function latLonToMercatorTile(lat: number, lon: number, z: number): { tx: number; ty: number } {
+function latLonToMercator(lat: number, lon: number, z: number): { mx: number; my: number } {
   const n = Math.pow(2, z)
   const clampedLat = Math.max(-85.05112878, Math.min(85.05112878, lat))
   const latRad = (clampedLat * Math.PI) / 180
-  const tx = ((lon + 180) / 360) * n
-  const ty = ((1 - Math.log(Math.tan(latRad) + 1 / Math.cos(latRad)) / Math.PI) / 2) * n
-  return { tx, ty }
+  const mx = ((lon + 180) / 360) * n
+  const my = ((1 - Math.log(Math.tan(latRad) + 1 / Math.cos(latRad)) / Math.PI) / 2) * n
+  return { mx, my }
+}
+
+function mercatorToLatLon(mx: number, my: number, z: number): { lat: number; lon: number } {
+  const n = Math.pow(2, z)
+  const lon = (mx / n) * 360 - 180
+  const mercN = Math.PI * (1 - (2 * my) / n)
+  const lat = (Math.atan(Math.sinh(mercN)) * 180) / Math.PI
+  return { lat, lon }
 }
 
 export const OfflineTrailMap: React.FC<OfflineTrailMapProps> = ({
   plannedTrack,
   offRouteThresholdM = 40
 }) => {
-  const mapContainerRef = useRef<HTMLDivElement | null>(null)
-  const mapRef = useRef<maplibregl.Map | null>(null)
-  const userMarkerRef = useRef<maplibregl.Marker | null>(null)
-  const poiMarkersRef = useRef<maplibregl.Marker[]>([])
-  const tileCacheMapRef = useRef<Record<string, string>>({})
+  const canvasRef = useRef<HTMLCanvasElement | null>(null)
+  const wrapperRef = useRef<HTMLDivElement | null>(null)
+  const loadedImgsRef = useRef<Record<string, HTMLImageElement>>({})
+  const inflightKeysRef = useRef<Record<string, boolean>>({})
+  const debounceTimerRef = useRef<number | null>(null)
+  const dragRef = useRef<DragSnapshot>({
+    dragging: false,
+    startX: 0,
+    startY: 0,
+    origLon: 120.96,
+    origLat: 23.65
+  })
 
   const {
     isRecording,
@@ -142,54 +160,64 @@ export const OfflineTrailMap: React.FC<OfflineTrailMapProps> = ({
   } = useTrailRecordingStore()
 
   const [regionPresetId, setRegionPresetId] = useState<RegionPresetId>('taiwan-rudy')
-  const [minZoom, setMinZoom] = useState<number>(8)
-  const [maxZoom, setMaxZoom] = useState<number>(12)
+  const [minZoom, setMinZoom] = useState<number>(9)
+  const [maxZoom, setMaxZoom] = useState<number>(13)
   const [batchCap, setBatchCap] = useState<number>(1500)
 
-  const [isTracking, setIsTracking] = useState(false)
-  const [latestPos, setLatestPos] = useState<{ lat: number; lon: number; ele: number } | null>(null)
-  const [offRouteDistance, setOffRouteDistance] = useState<number | null>(null)
-  const [downloadMsg, setDownloadMsg] = useState('')
-  const [isDownloading, setIsDownloading] = useState(false)
-  const [renderedTiles, setRenderedTiles] = useState<RenderedTile[]>([])
+  const [centerLon, setCenterLon] = useState<number>(120.96)
+  const [centerLat, setCenterLat] = useState<number>(23.65)
+  const [zoomLevel, setZoomLevel] = useState<number>(9)
 
-  const [poiName, setPoiName] = useState('')
+  const [isTracking, setIsTracking] = useState<boolean>(false)
+  const [latestPos, setLatestPos] = useState<GpsFix | null>(null)
+  const [offRouteDistance, setOffRouteDistance] = useState<number | null>(null)
+  const [downloadMsg, setDownloadMsg] = useState<string>('')
+  const [isDownloading, setIsDownloading] = useState<boolean>(false)
+
+  const [poiName, setPoiName] = useState<string>('')
   const [poiCategory, setPoiCategory] = useState<PoiCategory>('water')
-  const [poiNotes, setPoiNotes] = useState('')
+  const [poiNotes, setPoiNotes] = useState<string>('')
 
   const activePreset = REGION_PRESETS[regionPresetId]
   const recStats = useMemo(() => computeRecordedStats(recordedPoints), [recordedPoints])
 
-  const syncViewportTiles = useCallback(async () => {
-    const mapInstance = mapRef.current
-    const container = mapContainerRef.current
-    if (!mapInstance || !container) return
+  const renderMapCanvas = useCallback(() => {
+    const canvas = canvasRef.current
+    const wrapper = wrapperRef.current
+    if (!canvas || !wrapper) return
 
-    const widthPx = container.clientWidth
-    const heightPx = container.clientHeight
-    if (widthPx <= 0 || heightPx <= 0) return
+    const width = wrapper.clientWidth
+    const height = wrapper.clientHeight
+    if (width <= 0 || height <= 0) return
 
-    const z = Math.min(16, Math.max(2, Math.round(mapInstance.getZoom())))
-    const center = mapInstance.getCenter()
-    const scale = Math.pow(2, mapInstance.getZoom() - z)
-    const tileSizePx = 256 * scale
-    const centerMerc = latLonToMercatorTile(center.lat, center.lng, z)
+    const dpr = Math.min(window.devicePixelRatio || 1, 2)
+    const targetW = Math.floor(width * dpr)
+    const targetH = Math.floor(height * dpr)
+    if (canvas.width !== targetW || canvas.height !== targetH) {
+      canvas.width = targetW
+      canvas.height = targetH
+    }
+
+    const ctx = canvas.getContext('2d')
+    if (!ctx) return
+
+    ctx.save()
+    ctx.scale(dpr, dpr)
+    ctx.fillStyle = '#18202a'
+    ctx.fillRect(0, 0, width, height)
+
+    const z = Math.min(16, Math.max(2, Math.round(zoomLevel)))
+    const scale = Math.pow(2, zoomLevel - z)
+    const tilePx = 256 * scale
     const maxTileIdx = Math.pow(2, z)
 
-    const halfCols = Math.ceil(widthPx / tileSizePx / 2) + 1
-    const halfRows = Math.ceil(heightPx / tileSizePx / 2) + 1
-    const centerX = Math.floor(centerMerc.tx)
-    const centerY = Math.floor(centerMerc.ty)
+    const centerMerc = latLonToMercator(centerLat, centerLon, z)
+    const centerX = Math.floor(centerMerc.mx)
+    const centerY = Math.floor(centerMerc.my)
+    const halfCols = Math.ceil(width / tilePx / 2) + 1
+    const halfRows = Math.ceil(height / tilePx / 2) + 1
 
-    const candidates: Array<{
-      key: string
-      z: number
-      x: number
-      y: number
-      leftPx: number
-      topPx: number
-      sizePx: number
-    }> = []
+    const missingTiles: Array<{ key: string; z: number; x: number; y: number }> = []
 
     for (let dx = -halfCols; dx <= halfCols; dx += 1) {
       for (let dy = -halfRows; dy <= halfRows; dy += 1) {
@@ -197,175 +225,147 @@ export const OfflineTrailMap: React.FC<OfflineTrailMapProps> = ({
         const ty = centerY + dy
         if (ty < 0 || ty >= maxTileIdx) continue
 
-        const leftPx = widthPx / 2 + ((centerX + dx) - centerMerc.tx) * tileSizePx
-        const topPx = heightPx / 2 + (ty - centerMerc.ty) * tileSizePx
+        const leftPx = width / 2 + ((centerX + dx) - centerMerc.mx) * tilePx
+        const topPx = height / 2 + (ty - centerMerc.my) * tilePx
         const key = `${activePreset.sourceId}/${z}/${tx}/${ty}`
-        candidates.push({ key, z, x: tx, y: ty, leftPx, topPx, sizePx: Math.ceil(tileSizePx) + 1 })
+
+        const img = loadedImgsRef.current[key]
+        if (img && img.complete && img.naturalWidth > 0) {
+          ctx.drawImage(img, leftPx, topPx, tilePx + 0.8, tilePx + 0.8)
+        } else {
+          ctx.strokeStyle = 'rgba(148, 163, 184, 0.12)'
+          ctx.strokeRect(leftPx, topPx, tilePx, tilePx)
+          if (!inflightKeysRef.current[key]) {
+            missingTiles.push({ key, z, x: tx, y: ty })
+          }
+        }
       }
     }
 
-    const nextTiles: RenderedTile[] = []
-    await Promise.all(
-      candidates.map(async (c) => {
-        let url: string | undefined = tileCacheMapRef.current[c.key]
-        if (!url) {
-          try {
-            url = await invoke<string>('get_tile_data_url', {
-              sourceId: activePreset.sourceId,
-              z: c.z,
-              x: c.x,
-              y: c.y,
-              tileUrlTemplate: activePreset.tileUrlTemplate
-            })
-            tileCacheMapRef.current[c.key] = url
-          } catch {
-            return
-          }
-        }
-        nextTiles.push({ ...c, dataUrl: url })
+    const toScreen = (lat: number, lon: number) => {
+      const m = latLonToMercator(lat, lon, z)
+      return {
+        x: width / 2 + (m.mx - centerMerc.mx) * tilePx,
+        y: height / 2 + (m.my - centerMerc.my) * tilePx
+      }
+    }
+
+    if (plannedTrack.length >= 2) {
+      ctx.beginPath()
+      plannedTrack.forEach((pt, idx) => {
+        const p = toScreen(pt.lat, pt.lon)
+        if (idx === 0) ctx.moveTo(p.x, p.y)
+        else ctx.lineTo(p.x, p.y)
       })
-    )
-
-    setRenderedTiles(nextTiles)
-  }, [activePreset.sourceId, activePreset.tileUrlTemplate])
-
-  useEffect(() => {
-    const container = mapContainerRef.current
-    if (!container) return
-
-    const mapInstance = new maplibregl.Map({
-      container,
-      style: {
-        version: 8,
-        sources: {},
-        layers: [
-          {
-            id: 'bg-fill',
-            type: 'background',
-            paint: { 'background-color': '#18202a' }
-          }
-        ]
-      },
-      center: activePreset.center,
-      zoom: activePreset.zoom
-    })
-
-    mapInstance.addControl(new maplibregl.NavigationControl(), 'top-right')
-    mapRef.current = mapInstance
-
-    const onMoveEnd = () => {
-      void syncViewportTiles()
+      ctx.strokeStyle = '#84cc16'
+      ctx.lineWidth = 3.5
+      ctx.stroke()
     }
 
-    mapInstance.on('load', onMoveEnd)
-    mapInstance.on('moveend', onMoveEnd)
-    mapInstance.on('zoomend', onMoveEnd)
-
-    const resizeObserver = new ResizeObserver(() => {
-      mapInstance.resize()
-      void syncViewportTiles()
-    })
-    resizeObserver.observe(container)
-    void syncViewportTiles()
-
-    return () => {
-      mapInstance.off('load', onMoveEnd)
-      mapInstance.off('moveend', onMoveEnd)
-      mapInstance.off('zoomend', onMoveEnd)
-      resizeObserver.disconnect()
-      mapInstance.remove()
-      mapRef.current = null
+    if (recordedPoints.length >= 2) {
+      ctx.beginPath()
+      recordedPoints.forEach((pt, idx) => {
+        const p = toScreen(pt.lat, pt.lon)
+        if (idx === 0) ctx.moveTo(p.x, p.y)
+        else ctx.lineTo(p.x, p.y)
+      })
+      ctx.strokeStyle = '#38bdf8'
+      ctx.lineWidth = 4
+      ctx.stroke()
     }
-  }, [activePreset.sourceId, syncViewportTiles])
-
-  const handleSelectRegionPreset = (nextId: RegionPresetId) => {
-    setRegionPresetId(nextId)
-    tileCacheMapRef.current = {}
-    const preset = REGION_PRESETS[nextId]
-    if (nextId === 'taiwan-rudy') {
-      setMinZoom(8)
-      setMaxZoom(12)
-    } else if (nextId === 'viewport') {
-      setMinZoom(11)
-      setMaxZoom(14)
-    } else {
-      setMinZoom(4)
-      setMaxZoom(7)
-    }
-    if (mapRef.current) {
-      mapRef.current.flyTo({ center: preset.center, zoom: preset.zoom })
-    }
-  }
-
-  useEffect(() => {
-    const mapInstance = mapRef.current
-    if (!mapInstance || plannedTrack.length < 2) return
-
-    const renderPlanned = () => {
-      const geojson: GeoJSON.Feature<GeoJSON.LineString> = {
-        type: 'Feature',
-        properties: {},
-        geometry: { type: 'LineString', coordinates: plannedTrack.map((p) => [p.lon, p.lat]) }
-      }
-      if (mapInstance.getSource('planned-route')) {
-        ;(mapInstance.getSource('planned-route') as maplibregl.GeoJSONSource).setData(geojson)
-      } else {
-        mapInstance.addSource('planned-route', { type: 'geojson', data: geojson })
-        mapInstance.addLayer({
-          id: 'planned-route-line',
-          type: 'line',
-          source: 'planned-route',
-          paint: { 'line-color': '#84cc16', 'line-width': 4, 'line-opacity': 0.95 }
-        })
-      }
-    }
-
-    if (mapInstance.isStyleLoaded()) renderPlanned()
-    else mapInstance.once('load', renderPlanned)
-  }, [plannedTrack])
-
-  useEffect(() => {
-    const mapInstance = mapRef.current
-    if (!mapInstance) return
-    const drawRecorded = () => {
-      const geojson: GeoJSON.Feature<GeoJSON.LineString> = {
-        type: 'Feature',
-        properties: {},
-        geometry: {
-          type: 'LineString',
-          coordinates: recordedPoints.map((p) => [p.lon, p.lat])
-        }
-      }
-      if (mapInstance.getSource('recorded-route')) {
-        ;(mapInstance.getSource('recorded-route') as maplibregl.GeoJSONSource).setData(geojson)
-      } else if (recordedPoints.length >= 2) {
-        mapInstance.addSource('recorded-route', { type: 'geojson', data: geojson })
-        mapInstance.addLayer({
-          id: 'recorded-route-line',
-          type: 'line',
-          source: 'recorded-route',
-          paint: { 'line-color': '#38bdf8', 'line-width': 4, 'line-opacity': 0.95 }
-        })
-      }
-    }
-    if (mapInstance.isStyleLoaded()) drawRecorded()
-    else mapInstance.once('load', drawRecorded)
-  }, [recordedPoints])
-
-  useEffect(() => {
-    const mapInstance = mapRef.current
-    poiMarkersRef.current.forEach((m) => m.remove())
-    poiMarkersRef.current = []
-    if (!mapInstance) return
 
     pois.forEach((poi) => {
-      const marker = new maplibregl.Marker({ color: '#f59e0b' })
-        .setLngLat([poi.lon, poi.lat])
-        .setPopup(new maplibregl.Popup().setHTML(`<strong>${poi.name}</strong><br/>${POI_CATEGORY_LABELS[poi.category]}`))
-        .addTo(mapInstance)
-      poiMarkersRef.current.push(marker)
+      const p = toScreen(poi.lat, poi.lon)
+      ctx.beginPath()
+      ctx.arc(p.x, p.y, 6, 0, Math.PI * 2)
+      ctx.fillStyle = '#f59e0b'
+      ctx.fill()
+      ctx.lineWidth = 2
+      ctx.strokeStyle = '#0f172a'
+      ctx.stroke()
+
+      ctx.font = 'bold 11px sans-serif'
+      ctx.fillStyle = '#fef3c7'
+      ctx.fillText(poi.name, p.x + 9, p.y + 4)
     })
-  }, [pois])
+
+    if (latestPos) {
+      const u = toScreen(latestPos.lat, latestPos.lon)
+      ctx.beginPath()
+      ctx.arc(u.x, u.y, 7, 0, Math.PI * 2)
+      ctx.fillStyle = '#38bdf8'
+      ctx.fill()
+      ctx.lineWidth = 2.5
+      ctx.strokeStyle = '#ffffff'
+      ctx.stroke()
+    }
+
+    ctx.restore()
+
+    if (missingTiles.length > 0) {
+      missingTiles.forEach((item) => {
+        inflightKeysRef.current[item.key] = true
+      })
+      if (debounceTimerRef.current) window.clearTimeout(debounceTimerRef.current)
+      debounceTimerRef.current = window.setTimeout(() => {
+        void Promise.all(
+          missingTiles.slice(0, 24).map(async (item) => {
+            try {
+              const dataUrl = await invoke<string>('get_tile_data_url', {
+                sourceId: activePreset.sourceId,
+                z: item.z,
+                x: item.x,
+                y: item.y,
+                tileUrlTemplate: activePreset.tileUrlTemplate
+              })
+              const tileImg = new Image()
+              tileImg.onload = () => {
+                loadedImgsRef.current[item.key] = tileImg
+                delete inflightKeysRef.current[item.key]
+                renderMapCanvas()
+              }
+              tileImg.onerror = () => {
+                delete inflightKeysRef.current[item.key]
+              }
+              tileImg.src = dataUrl
+            } catch {
+              delete inflightKeysRef.current[item.key]
+            }
+          })
+        )
+      }, 45)
+    }
+  }, [
+    centerLat,
+    centerLon,
+    zoomLevel,
+    activePreset.sourceId,
+    activePreset.tileUrlTemplate,
+    plannedTrack,
+    recordedPoints,
+    pois,
+    latestPos
+  ])
+
+  useEffect(() => {
+    renderMapCanvas()
+    const wrapper = wrapperRef.current
+    if (!wrapper) return
+    const ro = new ResizeObserver(() => renderMapCanvas())
+    ro.observe(wrapper)
+    return () => {
+      ro.disconnect()
+      if (debounceTimerRef.current) window.clearTimeout(debounceTimerRef.current)
+    }
+  }, [renderMapCanvas])
+
+  useEffect(() => {
+    if (plannedTrack.length >= 2) {
+      setCenterLat(plannedTrack[0].lat)
+      setCenterLon(plannedTrack[0].lon)
+      setZoomLevel(13)
+    }
+  }, [plannedTrack])
 
   useEffect(() => {
     if (!isTracking || !navigator.geolocation) return
@@ -382,17 +382,8 @@ export const OfflineTrailMap: React.FC<OfflineTrailMapProps> = ({
         const { latitude, longitude, altitude, accuracy } = pos.coords
         const ele = Number.isFinite(altitude) && altitude !== null ? altitude : 0
         setLatestPos({ lat: latitude, lon: longitude, ele })
-
-        const mapInstance = mapRef.current
-        if (mapInstance) {
-          if (!userMarkerRef.current) {
-            userMarkerRef.current = new maplibregl.Marker({ color: '#38bdf8' })
-              .setLngLat([longitude, latitude])
-              .addTo(mapInstance)
-          } else {
-            userMarkerRef.current.setLngLat([longitude, latitude])
-          }
-        }
+        setCenterLat(latitude)
+        setCenterLon(longitude)
 
         ingestGpsSample({
           lat: latitude,
@@ -411,25 +402,95 @@ export const OfflineTrailMap: React.FC<OfflineTrailMapProps> = ({
           setOffRouteDistance(minDist > offRouteThresholdM ? Math.round(minDist) : null)
         }
       },
-      (err) => setDownloadMsg(`GPS 定位錯誤：${err.message}`),
+      (err) => {
+        setIsTracking(false)
+        if (err.code === 1) {
+          setDownloadMsg(
+            '定位權限被拒（User denied Geolocation）：請至手機「設定 > 應用程式 > ApexTrail OS > 權限」開啟位置權限或安裝新版 APK。'
+          )
+        } else {
+          setDownloadMsg(`GPS 定位錯誤：${err.message}`)
+        }
+      },
       gpsOptions
     )
     return () => navigator.geolocation.clearWatch(watchId)
   }, [isTracking, gnssMode, plannedTrack, offRouteThresholdM, ingestGpsSample])
 
-  const handleDownloadRegion = async () => {
-    const mapInstance = mapRef.current
-    if (!mapInstance) return
-    const bounds = mapInstance.getBounds()
-    const targetBounds = activePreset.bounds ?? {
-      minLat: bounds.getSouth(),
-      maxLat: bounds.getNorth(),
-      minLon: bounds.getWest(),
-      maxLon: bounds.getEast()
+  const handlePointerDown = (e: React.PointerEvent<HTMLCanvasElement>) => {
+    e.currentTarget.setPointerCapture(e.pointerId)
+    dragRef.current = {
+      dragging: true,
+      startX: e.clientX,
+      startY: e.clientY,
+      origLon: centerLon,
+      origLat: centerLat
     }
+  }
 
+  const handlePointerMove = (e: React.PointerEvent<HTMLCanvasElement>) => {
+    if (!dragRef.current.dragging) return
+    const dx = e.clientX - dragRef.current.startX
+    const dy = e.clientY - dragRef.current.startY
+    const z = Math.round(zoomLevel)
+    const worldPx = 256 * Math.pow(2, zoomLevel)
+    const origMerc = latLonToMercator(dragRef.current.origLat, dragRef.current.origLon, z)
+    const scaleToZ = Math.pow(2, z - zoomLevel)
+    const nextMx = origMerc.mx - (dx / worldPx) * Math.pow(2, zoomLevel) * scaleToZ
+    const nextMy = origMerc.my - (dy / worldPx) * Math.pow(2, zoomLevel) * scaleToZ
+    const nextLl = mercatorToLatLon(nextMx, nextMy, z)
+    setCenterLon(nextLl.lon)
+    setCenterLat(nextLl.lat)
+  }
+
+  const handlePointerUp = (e: React.PointerEvent<HTMLCanvasElement>) => {
+    if (dragRef.current.dragging) {
+      dragRef.current.dragging = false
+      if (e.currentTarget.hasPointerCapture(e.pointerId)) {
+        e.currentTarget.releasePointerCapture(e.pointerId)
+      }
+    }
+  }
+
+  const handleWheel = (e: React.WheelEvent<HTMLCanvasElement>) => {
+    e.preventDefault()
+    const delta = e.deltaY < 0 ? 0.5 : -0.5
+    setZoomLevel((prev) => Math.min(16, Math.max(2, Number((prev + delta).toFixed(2)))))
+  }
+
+  const resetTileMemory = () => {
+    loadedImgsRef.current = {}
+    inflightKeysRef.current = {}
+  }
+
+  const handleSelectRegionPreset = (nextId: RegionPresetId) => {
+    setRegionPresetId(nextId)
+    resetTileMemory()
+    const preset = REGION_PRESETS[nextId]
+    setCenterLon(preset.center[0])
+    setCenterLat(preset.center[1])
+    setZoomLevel(preset.zoom)
+    if (nextId === 'taiwan-rudy') {
+      setMinZoom(9)
+      setMaxZoom(13)
+    } else if (nextId === 'viewport') {
+      setMinZoom(11)
+      setMaxZoom(14)
+    } else {
+      setMinZoom(4)
+      setMaxZoom(7)
+    }
+  }
+
+  const handleDownloadRegion = async () => {
     const lowZ = Math.min(minZoom, maxZoom)
     const highZ = Math.max(minZoom, maxZoom)
+    const targetBounds = activePreset.bounds ?? {
+      minLat: centerLat - 0.12,
+      maxLat: centerLat + 0.12,
+      minLon: centerLon - 0.15,
+      maxLon: centerLon + 0.15
+    }
 
     setIsDownloading(true)
     setDownloadMsg(
@@ -466,8 +527,8 @@ export const OfflineTrailMap: React.FC<OfflineTrailMapProps> = ({
         `新下載 ${res.downloaded} 張、已快取 ${res.skipped_cached} 張、失敗 ${res.failed} 張${remainHint}`
       )
 
-      tileCacheMapRef.current = {}
-      await syncViewportTiles()
+      resetTileMemory()
+      renderMapCanvas()
     } catch (err) {
       setDownloadMsg(`下載失敗：${String(err)}`)
     } finally {
@@ -476,17 +537,15 @@ export const OfflineTrailMap: React.FC<OfflineTrailMapProps> = ({
   }
 
   const handleReloadTiles = () => {
-    tileCacheMapRef.current = {}
-    mapRef.current?.resize()
-    void syncViewportTiles()
+    resetTileMemory()
+    renderMapCanvas()
     setDownloadMsg('已重新載入本地離線圖資快取')
   }
 
   const handleAddPoiAtTarget = (e: React.FormEvent) => {
     e.preventDefault()
-    const center = mapRef.current?.getCenter()
-    const targetLat = latestPos?.lat ?? center?.lat ?? 24.18
-    const targetLon = latestPos?.lon ?? center?.lng ?? 120.99
+    const targetLat = latestPos?.lat ?? centerLat
+    const targetLon = latestPos?.lon ?? centerLon
     const targetEle = latestPos?.ele ?? 0
 
     addPoi({
@@ -567,7 +626,7 @@ export const OfflineTrailMap: React.FC<OfflineTrailMapProps> = ({
               min={2}
               max={15}
               value={minZoom}
-              onChange={(e) => setMinZoom(Number(e.target.value) || 8)}
+              onChange={(e) => setMinZoom(Number(e.target.value) || 9)}
               className="w-12 rounded-lg border border-[#2a323d] bg-[#161b22] px-1.5 py-1 text-center font-mono text-white"
             />
           </label>
@@ -579,7 +638,7 @@ export const OfflineTrailMap: React.FC<OfflineTrailMapProps> = ({
               min={2}
               max={16}
               value={maxZoom}
-              onChange={(e) => setMaxZoom(Number(e.target.value) || 12)}
+              onChange={(e) => setMaxZoom(Number(e.target.value) || 13)}
               className="w-12 rounded-lg border border-[#2a323d] bg-[#161b22] px-1.5 py-1 text-center font-mono text-white"
             />
           </label>
@@ -767,24 +826,37 @@ export const OfflineTrailMap: React.FC<OfflineTrailMapProps> = ({
         </div>
       )}
 
-      <div className="relative h-[460px] w-full overflow-hidden rounded-xl border border-[#2a323d] bg-[#18202a]">
-        <div ref={mapContainerRef} className="h-full w-full" />
-        <div className="pointer-events-none absolute inset-0 overflow-hidden">
-          {renderedTiles.map((tile) => (
-            <img
-              key={tile.key}
-              src={tile.dataUrl}
-              alt=""
-              style={{
-                position: 'absolute',
-                left: `${tile.leftPx}px`,
-                top: `${tile.topPx}px`,
-                width: `${tile.sizePx}px`,
-                height: `${tile.sizePx}px`,
-                maxWidth: 'none'
-              }}
-            />
-          ))}
+      <div ref={wrapperRef} className="relative h-[460px] w-full overflow-hidden rounded-xl border border-[#2a323d] bg-[#18202a]">
+        <canvas
+          ref={canvasRef}
+          onPointerDown={handlePointerDown}
+          onPointerMove={handlePointerMove}
+          onPointerUp={handlePointerUp}
+          onWheel={handleWheel}
+          className="h-full w-full touch-none cursor-grab active:cursor-grabbing"
+        />
+
+        <div className="absolute right-3 top-3 flex flex-col gap-1.5 rounded-xl border border-[#2a323d] bg-[#161b22]/90 p-1.5">
+          <button
+            type="button"
+            onClick={() => setZoomLevel((z) => Math.min(16, Number((z + 1).toFixed(2))))}
+            aria-label="放大地圖"
+            className="rounded-lg p-1.5 text-slate-200 hover:bg-[#2a323d]"
+          >
+            <Plus className="h-4 w-4" />
+          </button>
+          <button
+            type="button"
+            onClick={() => setZoomLevel((z) => Math.max(2, Number((z - 1).toFixed(2))))}
+            aria-label="縮小地圖"
+            className="rounded-lg p-1.5 text-slate-200 hover:bg-[#2a323d]"
+          >
+            <Minus className="h-4 w-4" />
+          </button>
+        </div>
+
+        <div className="pointer-events-none absolute bottom-2.5 left-3 rounded-lg bg-[#0d1117]/85 px-2.5 py-1 font-mono text-[11px] text-slate-300">
+          Z{zoomLevel.toFixed(1)} · {centerLat.toFixed(4)}, {centerLon.toFixed(4)} · {activePreset.label}
         </div>
       </div>
 
