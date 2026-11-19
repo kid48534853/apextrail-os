@@ -2,13 +2,26 @@ import React, { useEffect, useRef, useState } from 'react'
 import maplibregl from 'maplibre-gl'
 import 'maplibre-gl/dist/maplibre-gl.css'
 import { invoke } from '@tauri-apps/api/core'
-import { Compass, Download, AlertTriangle, Navigation } from 'lucide-react'
+import { Compass, Download, AlertTriangle, Navigation, RefreshCw } from 'lucide-react'
 import { TrackPoint } from '../../core/types/trail'
 import { haversineDistanceM } from '../../core/algorithms/trail-metrics'
 
 interface OfflineTrailMapProps {
   plannedTrack: TrackPoint[]
   offRouteThresholdM?: number
+}
+
+type TileSourceKey = 'rudy' | 'osm'
+
+const TILE_SOURCES: Record<TileSourceKey, { label: string; url: string }> = {
+  rudy: {
+    label: '魯地圖 Rudy Map',
+    url: 'https://tile.happyman.idv.tw/map/rudy/{z}/{x}/{y}.png'
+  },
+  osm: {
+    label: 'OpenStreetMap',
+    url: 'https://tile.openstreetmap.org/{z}/{x}/{y}.png'
+  }
 }
 
 export const OfflineTrailMap: React.FC<OfflineTrailMapProps> = ({
@@ -19,37 +32,62 @@ export const OfflineTrailMap: React.FC<OfflineTrailMapProps> = ({
   const mapRef = useRef<maplibregl.Map | null>(null)
   const userMarkerRef = useRef<maplibregl.Marker | null>(null)
 
+  const [sourceKey, setSourceKey] = useState<TileSourceKey>('rudy')
   const [isTracking, setIsTracking] = useState(false)
   const [offRouteDistance, setOffRouteDistance] = useState<number | null>(null)
   const [downloadMsg, setDownloadMsg] = useState('')
   const [isDownloading, setIsDownloading] = useState(false)
 
   useEffect(() => {
-    if (!mapContainerRef.current) return
+    const container = mapContainerRef.current
+    if (!container) return
+
     const map = new maplibregl.Map({
-      container: mapContainerRef.current,
+      container,
       style: {
         version: 8,
         sources: {
           'offline-topo': {
             type: 'raster',
-            tiles: ['offline-tile://localhost/rudy/{z}/{x}/{y}.png'],
+            tiles: [`offline-tile://localhost/${sourceKey}/{z}/{x}/{y}.png`],
             tileSize: 256,
-            attribution: 'Rudy Map / OSM Offline'
+            minzoom: 0,
+            maxzoom: 17,
+            attribution: `${TILE_SOURCES[sourceKey].label} Offline`
           }
         },
-        layers: [{ id: 'topo-layer', type: 'raster', source: 'offline-topo' }]
+        layers: [
+          {
+            id: 'bg-fill',
+            type: 'background',
+            paint: { 'background-color': '#1b222c' }
+          },
+          {
+            id: 'topo-layer',
+            type: 'raster',
+            source: 'offline-topo',
+            paint: { 'raster-opacity': 1 }
+          }
+        ]
       },
       center: [120.99, 24.18],
       zoom: 13
     })
+
     map.addControl(new maplibregl.NavigationControl(), 'top-right')
     mapRef.current = map
+
+    const resizeObserver = new ResizeObserver(() => {
+      map.resize()
+    })
+    resizeObserver.observe(container)
+
     return () => {
+      resizeObserver.disconnect()
       map.remove()
       mapRef.current = null
     }
-  }, [])
+  }, [sourceKey])
 
   useEffect(() => {
     const map = mapRef.current
@@ -69,7 +107,7 @@ export const OfflineTrailMap: React.FC<OfflineTrailMapProps> = ({
           id: 'planned-route-line',
           type: 'line',
           source: 'planned-route',
-          paint: { 'line-color': '#84cc16', 'line-width': 4, 'line-opacity': 0.9 }
+          paint: { 'line-color': '#84cc16', 'line-width': 4, 'line-opacity': 0.95 }
         })
       }
       const bounds = new maplibregl.LngLatBounds()
@@ -89,7 +127,9 @@ export const OfflineTrailMap: React.FC<OfflineTrailMapProps> = ({
         const map = mapRef.current
         if (!map) return
         if (!userMarkerRef.current) {
-          userMarkerRef.current = new maplibregl.Marker({ color: '#38bdf8' }).setLngLat([longitude, latitude]).addTo(map)
+          userMarkerRef.current = new maplibregl.Marker({ color: '#38bdf8' })
+            .setLngLat([longitude, latitude])
+            .addTo(map)
         } else {
           userMarkerRef.current.setLngLat([longitude, latitude])
         }
@@ -112,26 +152,49 @@ export const OfflineTrailMap: React.FC<OfflineTrailMapProps> = ({
     const map = mapRef.current
     if (!map) return
     const bounds = map.getBounds()
+    const currentZoom = Math.min(16, Math.max(12, Math.round(map.getZoom())))
     setIsDownloading(true)
-    setDownloadMsg('正在下載當前視野離線圖資 (Z12~Z15)...')
+    setDownloadMsg(`正在下載 ${TILE_SOURCES[sourceKey].label} 離線圖資 (Z${currentZoom - 1}~Z${currentZoom})...`)
     try {
-      const res = await invoke<{ downloaded: number; skipped_cached: number }>('download_offline_region', {
+      const res = await invoke<{
+        total_tiles: number
+        downloaded: number
+        skipped_cached: number
+        failed: number
+      }>('download_offline_region', {
         payload: {
-          source_id: 'rudy',
-          tile_url_template: 'https://tile.happyman.idv.tw/map/rudy/{z}/{x}/{y}.png',
+          source_id: sourceKey,
+          tile_url_template: TILE_SOURCES[sourceKey].url,
           min_lat: bounds.getSouth(),
           max_lat: bounds.getNorth(),
           min_lon: bounds.getWest(),
           max_lon: bounds.getEast(),
-          min_zoom: 12,
-          max_zoom: 15
+          min_zoom: Math.max(11, currentZoom - 1),
+          max_zoom: currentZoom
         }
       })
-      setDownloadMsg(`離線圖資完成：新下載 ${res.downloaded} 張，已快取 ${res.skipped_cached} 張`)
+      setDownloadMsg(
+        `離線圖資完成：新下載 ${res.downloaded} 張、已快取 ${res.skipped_cached} 張、失敗 ${res.failed} 張（共 ${res.total_tiles} 張）`
+      )
+      const src = map.getSource('offline-topo') as maplibregl.RasterTileSource | undefined
+      if (src) src.setTiles([`offline-tile://localhost/${sourceKey}/{z}/{x}/{y}.png?t=${Date.now()}`])
+      map.triggerRepaint()
     } catch (err) {
       setDownloadMsg(`下載失敗：${String(err)}`)
     } finally {
       setIsDownloading(false)
+    }
+  }
+
+  const handleReloadTiles = () => {
+    const map = mapRef.current
+    if (!map) return
+    map.resize()
+    const src = map.getSource('offline-topo') as maplibregl.RasterTileSource | undefined
+    if (src) {
+      src.setTiles([`offline-tile://localhost/${sourceKey}/{z}/{x}/{y}.png?t=${Date.now()}`])
+      map.triggerRepaint()
+      setDownloadMsg('已重新載入本地離線圖資快取')
     }
   }
 
@@ -142,8 +205,26 @@ export const OfflineTrailMap: React.FC<OfflineTrailMapProps> = ({
           <Compass className="h-4 w-4 text-[#84cc16]" />
           <span>離線等高線地圖與 GPS 即時導航</span>
         </div>
-        <div className="flex items-center gap-2">
+        <div className="flex flex-wrap items-center gap-2">
+          <select
+            value={sourceKey}
+            onChange={(e) => setSourceKey(e.target.value as TileSourceKey)}
+            aria-label="選擇地圖來源"
+            className="rounded-lg border border-[#2a323d] bg-[#1f2630] px-2.5 py-1.5 text-xs font-bold text-slate-200"
+          >
+            <option value="rudy">魯地圖 Rudy Map</option>
+            <option value="osm">OpenStreetMap</option>
+          </select>
           <button
+            type="button"
+            onClick={handleReloadTiles}
+            className="flex items-center gap-1 rounded-lg border border-[#2a323d] bg-[#1f2630] px-2.5 py-1.5 text-xs font-bold text-slate-200"
+          >
+            <RefreshCw className="h-3.5 w-3.5" />
+            刷新圖磚
+          </button>
+          <button
+            type="button"
             onClick={() => setIsTracking((prev) => !prev)}
             className={`flex items-center gap-1.5 rounded-lg px-3 py-1.5 text-xs font-bold ${
               isTracking ? 'bg-sky-500 text-slate-950' : 'border border-[#2a323d] bg-[#1f2630] text-slate-200'
@@ -153,6 +234,7 @@ export const OfflineTrailMap: React.FC<OfflineTrailMapProps> = ({
             {isTracking ? 'GPS 定位中' : '開啟 GPS 定位'}
           </button>
           <button
+            type="button"
             onClick={handleDownloadViewport}
             disabled={isDownloading}
             className="flex items-center gap-1.5 rounded-lg bg-[#84cc16] px-3 py-1.5 text-xs font-bold text-slate-950 disabled:opacity-50"
@@ -170,7 +252,7 @@ export const OfflineTrailMap: React.FC<OfflineTrailMapProps> = ({
         </div>
       )}
 
-      <div ref={mapContainerRef} className="h-[420px] w-full overflow-hidden rounded-xl border border-[#2a323d]" />
+      <div ref={mapContainerRef} className="h-[460px] w-full overflow-hidden rounded-xl border border-[#2a323d]" />
       {downloadMsg && <p className="text-xs text-sky-400">{downloadMsg}</p>}
     </div>
   )

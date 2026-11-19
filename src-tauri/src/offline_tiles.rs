@@ -1,6 +1,5 @@
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
-use std::f64::consts::PI;
 use std::path::PathBuf;
 use tauri::{AppHandle, Manager};
 
@@ -12,8 +11,8 @@ pub struct DownloadRegionPayload {
     pub max_lat: f64,
     pub min_lon: f64,
     pub max_lon: f64,
-    pub min_zoom: u8,
-    pub max_zoom: u8,
+    pub min_zoom: u32,
+    pub max_zoom: u32,
 }
 
 #[derive(Debug, Serialize)]
@@ -24,19 +23,111 @@ pub struct DownloadResult {
     pub failed: usize,
 }
 
+pub const TRANSPARENT_PNG_1X1: &[u8] = &[
+    0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D,
+    0x49, 0x48, 0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01,
+    0x08, 0x06, 0x00, 0x00, 0x00, 0x1F, 0x15, 0xC4, 0x89, 0x00, 0x00, 0x00,
+    0x0D, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9C, 0x63, 0x00, 0x01, 0x00, 0x00,
+    0x05, 0x00, 0x01, 0x0D, 0x0A, 0x2D, 0xB4, 0x00, 0x00, 0x00, 0x00, 0x49,
+    0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
+];
+
 fn get_db_path(app: &AppHandle) -> Result<PathBuf, String> {
-    let mut dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
-    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-    dir.push("apextrail_offline.db");
-    Ok(dir)
+    let app_data_dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|e| format!("無法取得 AppData 目錄: {e}"))?;
+    std::fs::create_dir_all(&app_data_dir)
+        .map_err(|e| format!("建立 AppData 目錄失敗: {e}"))?;
+    Ok(app_data_dir.join("offline_map_tiles.sqlite"))
 }
 
-fn lon_lat_to_tile(lon: f64, lat: f64, zoom: u8) -> (u32, u32) {
-    let n = 2_f64.powi(zoom as i32);
-    let x = ((lon + 180.0) / 360.0 * n).floor() as u32;
-    let lat_rad = lat.clamp(-85.0511, 85.0511).to_radians();
-    let y = ((1.0 - (lat_rad.tan() + 1.0 / lat_rad.cos()).ln() / PI) / 2.0 * n).floor() as u32;
+fn open_db(app: &AppHandle) -> Result<Connection, String> {
+    let db_path = get_db_path(app)?;
+    let conn = Connection::open(db_path).map_err(|e| format!("開啟 SQLite 失敗: {e}"))?;
+    conn.execute_batch(
+        "PRAGMA journal_mode = WAL;
+         PRAGMA synchronous = NORMAL;
+         CREATE TABLE IF NOT EXISTS offline_tiles (
+             source_id TEXT NOT NULL,
+             z INTEGER NOT NULL,
+             x INTEGER NOT NULL,
+             y INTEGER NOT NULL,
+             tile_data BLOB NOT NULL,
+             updated_at INTEGER NOT NULL,
+             PRIMARY KEY (source_id, z, x, y)
+         );",
+    )
+    .map_err(|e| format!("初始化資料表失敗: {e}"))?;
+    Ok(conn)
+}
+
+fn lat_lon_to_tile_xy(lat: f64, lon: f64, z: u32) -> (u32, u32) {
+    let n = (1_u32 << z.min(20)) as f64;
+    let clamped_lat = lat.clamp(-85.05112878, 85.05112878);
+    let lat_rad = clamped_lat.to_radians();
+    let x = (((lon + 180.0) / 360.0) * n).floor().max(0.0).min(n - 1.0) as u32;
+    let y = (((1.0 - (lat_rad.tan() + 1.0 / lat_rad.cos()).ln() / std::f64::consts::PI) / 2.0) * n)
+        .floor()
+        .max(0.0)
+        .min(n - 1.0) as u32;
     (x, y)
+}
+
+fn resolve_tile_url(template: &str, source_id: &str, z: u32, x: u32, y: u32) -> String {
+    if !template.trim().is_empty() {
+        return template
+            .replace("{z}", &z.to_string())
+            .replace("{x}", &x.to_string())
+            .replace("{y}", &y.to_string());
+    }
+    if source_id == "rudy" {
+        format!("https://tile.happyman.idv.tw/map/rudy/{z}/{x}/{y}.png")
+    } else {
+        format!("https://tile.openstreetmap.org/{z}/{x}/{y}.png")
+    }
+}
+
+pub fn read_cached_tile(app: &AppHandle, source_id: &str, z: u32, x: u32, y: u32) -> Option<Vec<u8>> {
+    let conn = open_db(app).ok()?;
+    let mut stmt = conn
+        .prepare("SELECT tile_data FROM offline_tiles WHERE source_id = ?1 AND z = ?2 AND x = ?3 AND y = ?4")
+        .ok()?;
+    stmt.query_row(params![source_id, z as i64, x as i64, y as i64], |row| {
+        row.get::<_, Vec<u8>>(0)
+    })
+    .ok()
+}
+
+pub fn fetch_and_cache_tile(app: &AppHandle, source_id: &str, z: u32, x: u32, y: u32) -> Option<Vec<u8>> {
+    let url = resolve_tile_url("", source_id, z, x, y);
+    let client = reqwest::blocking::Client::builder()
+        .user_agent("ApexTrailOS/1.0 (Offline-First Trail Companion)")
+        .timeout(std::time::Duration::from_secs(6))
+        .build()
+        .ok()?;
+
+    let resp = client.get(&url).send().ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    let bytes = resp.bytes().ok()?.to_vec();
+    if bytes.is_empty() {
+        return None;
+    }
+
+    if let Ok(conn) = open_db(app) {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        let _ = conn.execute(
+            "INSERT OR REPLACE INTO offline_tiles (source_id, z, x, y, tile_data, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![source_id, z as i64, x as i64, y as i64, &bytes, now],
+        );
+    }
+    Some(bytes)
 }
 
 #[tauri::command]
@@ -44,81 +135,88 @@ pub async fn download_offline_region(
     app: AppHandle,
     payload: DownloadRegionPayload,
 ) -> Result<DownloadResult, String> {
-    if payload.max_zoom > 16 || payload.min_zoom > payload.max_zoom {
-        return Err("縮放層級無效（限制 Z1~Z16）".to_string());
-    }
-    let db_path = get_db_path(&app)?;
-    let conn = Connection::open(&db_path).map_err(|e| e.to_string())?;
-    conn.execute(
-        "CREATE TABLE IF NOT EXISTS offline_tiles (
-            source_id TEXT NOT NULL, z INTEGER NOT NULL, x INTEGER NOT NULL, y INTEGER NOT NULL,
-            tile_data BLOB NOT NULL, PRIMARY KEY (source_id, z, x, y)
-        )",
-        [],
-    )
-    .map_err(|e| e.to_string())?;
+    let min_z = payload.min_zoom.min(payload.max_zoom).min(17);
+    let max_z = payload.min_zoom.max(payload.max_zoom).min(17);
+    let south = payload.min_lat.min(payload.max_lat);
+    let north = payload.min_lat.max(payload.max_lat);
+    let west = payload.min_lon.min(payload.max_lon);
+    let east = payload.min_lon.max(payload.max_lon);
 
-    let mut coords = Vec::new();
-    for z in payload.min_zoom..=payload.max_zoom {
-        let (x_min, y_max) = lon_lat_to_tile(payload.min_lon, payload.min_lat, z);
-        let (x_max, y_min) = lon_lat_to_tile(payload.max_lon, payload.max_lat, z);
-        for x in x_min..=x_max {
-            for y in y_min..=y_max {
+    let mut coords: Vec<(u32, u32, u32)> = Vec::new();
+    for z in min_z..=max_z {
+        let (x_min, y_min) = lat_lon_to_tile_xy(north, west, z);
+        let (x_max, y_max) = lat_lon_to_tile_xy(south, east, z);
+        for x in x_min.min(x_max)..=x_min.max(x_max) {
+            for y in y_min.min(y_max)..=y_min.max(y_max) {
                 coords.push((z, x, y));
+                if coords.len() >= 450 {
+                    break;
+                }
+            }
+            if coords.len() >= 450 {
+                break;
             }
         }
-    }
-    if coords.len() > 3000 {
-        return Err(format!("區域過大（{} 張，上限 3000）", coords.len()));
+        if coords.len() >= 450 {
+            break;
+        }
     }
 
+    let conn = open_db(&app)?;
     let client = reqwest::Client::builder()
-        .user_agent("ApexTrailOS/1.0")
+        .user_agent("ApexTrailOS/1.0 (Offline-First Trail Companion)")
+        .timeout(std::time::Duration::from_secs(10))
         .build()
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| format!("建立 HTTP 用戶端失敗: {e}"))?;
 
-    let (mut downloaded, mut skipped_cached, mut failed) = (0, 0, 0);
+    let mut downloaded = 0_usize;
+    let mut skipped_cached = 0_usize;
+    let mut failed = 0_usize;
+    let total_tiles = coords.len();
+
     for (z, x, y) in &coords {
-        let exists: bool = conn
+        let exists: i64 = conn
             .query_row(
-                "SELECT EXISTS(SELECT 1 FROM offline_tiles WHERE source_id=?1 AND z=?2 AND x=?3 AND y=?4)",
-                params![&payload.source_id, *z as i64, *x as i64, *y as i64],
-                |r| r.get(0),
+                "SELECT COUNT(1) FROM offline_tiles WHERE source_id = ?1 AND z = ?2 AND x = ?3 AND y = ?4",
+                params![payload.source_id, *z as i64, *x as i64, *y as i64],
+                |row| row.get(0),
             )
-            .unwrap_or(false);
-        if exists {
+            .unwrap_or(0);
+
+        if exists > 0 {
             skipped_cached += 1;
             continue;
         }
-        let url = payload
-            .tile_url_template
-            .replace("{z}", &z.to_string())
-            .replace("{x}", &x.to_string())
-            .replace("{y}", &y.to_string());
+
+        let url = resolve_tile_url(&payload.tile_url_template, &payload.source_id, *z, *x, *y);
         match client.get(&url).send().await {
-            Ok(resp) if resp.status().is_success() => {
-                if let Ok(bytes) = resp.bytes().await {
-                    let _ = conn.execute(
-                        "INSERT OR REPLACE INTO offline_tiles (source_id,z,x,y,tile_data) VALUES (?1,?2,?3,?4,?5)",
-                        params![&payload.source_id, *z as i64, *x as i64, *y as i64, bytes.as_ref()],
+            Ok(resp) if resp.status().is_success() => match resp.bytes().await {
+                Ok(bytes) if !bytes.is_empty() => {
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs() as i64)
+                        .unwrap_or(0);
+                    let res = conn.execute(
+                        "INSERT OR REPLACE INTO offline_tiles (source_id, z, x, y, tile_data, updated_at)
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                        params![payload.source_id, *z as i64, *x as i64, *y as i64, bytes.as_ref(), now],
                     );
-                    downloaded += 1;
-                } else {
-                    failed += 1;
+                    if res.is_ok() {
+                        downloaded += 1;
+                    } else {
+                        failed += 1;
+                    }
                 }
-            }
+                _ => failed += 1,
+            },
             _ => failed += 1,
         }
     }
-    Ok(DownloadResult { total_tiles: coords.len(), downloaded, skipped_cached, failed })
-}
 
-pub fn read_cached_tile(app: &AppHandle, source_id: &str, z: u32, x: u32, y: u32) -> Option<Vec<u8>> {
-    let conn = Connection::open(get_db_path(app).ok()?).ok()?;
-    conn.query_row(
-        "SELECT tile_data FROM offline_tiles WHERE source_id=?1 AND z=?2 AND x=?3 AND y=?4",
-        params![source_id, z as i64, x as i64, y as i64],
-        |r| r.get::<_, Vec<u8>>(0),
-    )
-    .ok()
+    Ok(DownloadResult {
+        total_tiles,
+        downloaded,
+        skipped_cached,
+        failed,
+    })
 }
